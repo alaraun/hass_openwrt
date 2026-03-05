@@ -24,6 +24,7 @@ class DeviceCoordinator:
         self._id = config["id"]
         self._apis = None
         self._wps = config.get("wps", False)
+        self._wireless_via_uci = False  # True after network.wireless status fails (OpenWrt 25.12 bug)
 
         self._coordinator = DataUpdateCoordinator(
             hass,
@@ -65,28 +66,42 @@ class DeviceCoordinator:
                     # UCI returns strings, convert to boolean / UCI devuelve strings, convertir a boolean
                     device_disabled[device_name] = disabled in ['1', 'true', True]
 
-            # Now process wifi-iface interfaces / Ahora procesar las interfaces wifi-iface
+            # Pre-pass: generate ifnames for sections that lack an explicit 'ifname' in UCI.
+            # OpenWrt 25.12+ with ucode wifi-scripts no longer stores 'option ifname' in UCI;
+            # the ifname is generated at runtime as phy{N}-{mode}{idx} (e.g. phy0-ap0).
+            # Old OpenWrt versions do have 'option ifname', so those take priority below.
+            generated_ifnames: dict = {}
+            device_mode_count: dict = {}
+            for _section, _data in sorted(values.items(), key=lambda x: x[1].get('.index', 999)):
+                if _data.get('.type') != 'wifi-iface' or _data.get('ifname'):
+                    continue
+                _device = _data.get('device', '')
+                _mode = _data.get('mode', 'ap')
+                radio_num = ''.join(c for c in _device if c.isdigit()) or '0'
+                counters = device_mode_count.setdefault(_device, {})
+                idx = counters.get(_mode, 0)
+                counters[_mode] = idx + 1
+                generated_ifnames[_section] = f"phy{radio_num}-{_mode}{idx}"
+
+            # Now process wifi-iface interfaces
             for section, data in values.items():
-                # Only interested in wifi-iface sections / Solo nos interesan las secciones tipo wifi-iface
                 if data.get('.type') != 'wifi-iface':
                     continue
 
                 device = data.get('device')
                 if not device:
-                    _LOGGER.debug(f"wifi-iface {section} no tiene device")
+                    _LOGGER.debug(f"wifi-iface {section} has no device")
                     continue
 
-                # Skip if radio is disabled / Saltarse si el radio está deshabilitado
+                # Skip if radio is disabled
                 if device_disabled.get(device, False):
                     _LOGGER.debug(f"Device {device} is disabled, skipping interface {section}")
                     continue
 
-                # # Build ifname from device and section name / Construir ifname desde device y nombre de sección
-                # En UCI, el ifname típicamente se construye como "phy{index}-{mode}{number}"
-                # Pero también podemos usar el nombre de la sección como identificador
-                ifname = data.get('ifname') or data.get('ssid') or section
+                # Prefer explicit UCI ifname (old OpenWrt), fall back to generated name (25.12+)
+                ifname = data.get('ifname') or generated_ifnames.get(section)
                 if not ifname:
-                    _LOGGER.debug(f"iface {section} no tiene ifname ni nombre de sección")
+                    _LOGGER.debug(f"iface {section} has no ifname and could not generate one")
                     continue
 
                 # network can be string or list in UCI
@@ -483,6 +498,7 @@ class DeviceCoordinator:
     async def load_ubus(self):
         """Load UBUS ACLs from the session."""
         _LOGGER.debug("Calling load_ubus()")
+        self._wireless_via_uci = False  # Reset on re-login; router may have been updated
         # If ACLs are not loaded yet, we need to login first
         if not self._ubus.acls:
             _LOGGER.debug("ACLs not loaded yet, performing login to obtain ACLs")
@@ -558,21 +574,25 @@ class DeviceCoordinator:
                 result = dict()
                 result["info"] = await self.update_info()
 
-                # Prefer ubus "network.wireless" if available, otherwise fall back to UCI
+                # Prefer ubus "network.wireless" if available, otherwise fall back to UCI.
+                # OpenWrt 25.12 bug: network.wireless status returns [2] via rpcd HTTP even when
+                # the ACL is correct. After the first failure we permanently use UCI for this
+                # session to avoid a warning log on every 30-second update.
                 wireless_config = dict(ap=[], mesh=[])
-                # Try the preferred ubus "network.wireless" method first. If it exists but
-                # fails, fall back to UCI-based discovery. If ubus network.wireless isn't
-                # supported, use UCI directly.
-                if self.is_api_supported("network.wireless"):
+                if self.is_api_supported("network.wireless") and not self._wireless_via_uci:
                     _LOGGER.debug("Using ubus network.wireless for wireless discovery")
                     try:
                         wireless_config = await self.discover_wireless()
                     except Exception as err:
-                        _LOGGER.warning("discover_wireless failed, trying UCI fallback: %s", err)
+                        _LOGGER.warning(
+                            "discover_wireless failed, switching permanently to UCI fallback "
+                            "(known OpenWrt 25.12 rpcd bug if error is 'RPC error: 2'): %s", err
+                        )
+                        self._wireless_via_uci = True
                         try:
                             wireless_config = await self.discover_wireless_uci()
                         except Exception as err2:
-                            _LOGGER.warning("discover_wireless_uci fallback failed, using empty result: %s", err2)
+                            _LOGGER.warning("discover_wireless_uci fallback also failed: %s", err2)
                 else:
                     _LOGGER.debug("Using UCI (uci get wireless) for wireless discovery")
                     try:

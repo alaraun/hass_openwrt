@@ -43,7 +43,7 @@ class Ubus:
         except PermissionError as err:
             _LOGGER.error(f"PermissionError during api_call: {err}")
         except NameError as err:
-            _LOGGER.error(f"NameError during api_call: {err}")
+            _LOGGER.debug(f"api_call: object not found, returning empty: {err}")
             return {}  # Return an empty dict if the object is not found
 
         await self._login()
@@ -110,11 +110,13 @@ class Ubus:
         if "error" in json_response:
             code = json_response['error'].get('code')
             message = json_response['error'].get('message')
+            if code == -32000:
+                # Object not found — expected when optional ubus objects (mwan3, etc.) aren't installed
+                _LOGGER.debug(f"api_call: ubus object not found: {message}")
+                raise NameError(message)
             _LOGGER.error(f"api_call RPC error: {json_response['error']}")
             if code == -32002:
                 raise PermissionError(message)
-            if code == -32000:
-                raise NameError(message)
             raise ConnectionError(f"RPC error: {message}")
 
         result = json_response['result']
