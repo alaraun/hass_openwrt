@@ -1,13 +1,13 @@
 {
   "domain": "openwrt",
   "name": "OpenWrt",
-  "documentation": "https://github.com/MiJimMor/hass_openwrt",
-  "issue_tracker": "https://github.com/MiJimMor/hass_openwrt/issues",
+  "documentation": "https://github.com/alaraun/hass_openwrt",
+  "issue_tracker": "https://github.com/alaraun/hass_openwrt/issues",
   "dependencies": [],
-  "codeowners": ["@MiJimMor"],
+  "codeowners": ["@alaraun"],
   "requirements": [],
   "iot_class": "local_polling",
   "config_flow": true,
-  "version": "0.3.0"
+  "version": "0.4.0"
 }
 

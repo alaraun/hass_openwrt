@@ -5,7 +5,6 @@ from homeassistant.core import HomeAssistant
 import logging
 
 from . import OpenWrtEntity
-from .constants import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -13,26 +12,21 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities
+    async_add_entities,
 ) -> None:
+    device = entry.runtime_data
+    device_id = entry.data["id"]
 
-    entities = []
-    data = entry.as_dict()
-    device = hass.data[DOMAIN]['devices'][entry.entry_id]
-    device_id = data['data']['id']
-
-    # This one will be always here
-    entities.append(OpenWrtSensor(device, device_id))
+    entities = [OpenWrtBinarySensor(device, device_id)]
 
     for net_id in device.coordinator.data["mwan3"]:
-        entities.append(
-            Mwan3OnlineBinarySensor(device, device_id, net_id)
-        )
+        entities.append(Mwan3OnlineBinarySensor(device, device_id, net_id))
+
     async_add_entities(entities)
     return True
 
 
-class OpenWrtSensor(OpenWrtEntity, BinarySensorEntity):
+class OpenWrtBinarySensor(OpenWrtEntity, BinarySensorEntity):
 
     def __init__(self, device, device_id: str):
         super().__init__(device, device_id)

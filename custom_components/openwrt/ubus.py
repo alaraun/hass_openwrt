@@ -1,25 +1,23 @@
-from homeassistant.exceptions import IntegrationError
-import json
+import aiohttp
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import logging
-import typing
-
-import requests
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT: int = 15
 
+
 class Ubus:
     def __init__(
         self,
-        executor_job: typing.Callable,
+        hass,
         url: str,
         username: str,
         password: str,
         timeout: int = DEFAULT_TIMEOUT,
-        verify: bool = True
+        verify: bool = True,
     ):
-        self.executor_job = executor_job
+        self._hass = hass
         self.url = url
         self.username = username
         self.password = password
@@ -27,24 +25,28 @@ class Ubus:
         self.verify = verify
         self.session_id = ""
         self.rpc_id = 1
-        self.acls = {}  # Guardar los ACLs del login
+        self.acls = {}
+
+    @property
+    def _session(self) -> aiohttp.ClientSession:
+        return async_get_clientsession(self._hass, verify_ssl=self.verify)
 
     async def api_call(
         self,
         subsystem: str,
         method: str,
         params: dict,
-        rpc_method: str = "call"
+        rpc_method: str = "call",
     ) -> dict:
-        _LOGGER.debug(f"Starting api_call with subsystem: {subsystem}, method: {method}, params: {params}")
+        _LOGGER.debug("api_call: %s.%s params=%s", subsystem, method, params)
         try:
             if self.session_id:
                 return await self._api_call(rpc_method, subsystem, method, params)
         except PermissionError as err:
-            _LOGGER.error(f"PermissionError during api_call: {err}")
+            _LOGGER.error("PermissionError during api_call: %s", err)
         except NameError as err:
-            _LOGGER.debug(f"api_call: object not found, returning empty: {err}")
-            return {}  # Return an empty dict if the object is not found
+            _LOGGER.debug("api_call: object not found, returning empty: %s", err)
+            return {}
 
         await self._login()
         return await self._api_call(rpc_method, subsystem, method, params)
@@ -56,10 +58,11 @@ class Ubus:
             "session",
             "login",
             dict(username=self.username, password=self.password),
-            "00000000000000000000000000000000")
+            "00000000000000000000000000000000",
+        )
         _LOGGER.debug("Login result: %s", result)
         self.session_id = result["ubus_rpc_session"]
-        self.acls = result.get("acls", {})  # Guardar los ACLs
+        self.acls = result.get("acls", {})
         _LOGGER.debug("ACLs: %s", self.acls)
 
     async def _api_call(
@@ -73,74 +76,57 @@ class Ubus:
         _params = [session if session else self.session_id, subsystem]
         if method:
             _params.append(method)
-        if params:
-            _params.append(params)
-        else:
-            _params.append({})
-        data = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": self.rpc_id,
-                "method": rpc_method,
-                "params": _params,
-            }
-        )
-        _LOGGER.debug(f'New API call with data: {data}')
+        _params.append(params if params else {})
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self.rpc_id,
+            "method": rpc_method,
+            "params": _params,
+        }
+        _LOGGER.debug("API call payload: %s", payload)
         self.rpc_id += 1
+
         try:
-            def post():
-                return requests.post(
-                    self.url,
-                    data=data,
-                    timeout=self.timeout,
-                    verify=self.verify
-                )
-            response = await self.executor_job(post)
-        except Exception as err:
-            _LOGGER.error(f"api_call exception: {err}")
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with self._session.post(
+                self.url, json=payload, timeout=timeout
+            ) as response:
+                if response.status != 200:
+                    _LOGGER.error("api_call http error: %s", response.status)
+                    raise ConnectionError(f"HTTP error: {response.status}")
+                # content_type=None avoids strict checking; rpcd may omit application/json
+                json_response = await response.json(content_type=None)
+        except aiohttp.ClientError as err:
+            _LOGGER.error("api_call exception: %s", err)
             raise ConnectionError from err
 
-        if response.status_code != 200:
-            _LOGGER.error(f"api_call http error: {response.status_code}")
-            raise ConnectionError(f"HTTP error: {response.status_code}")
-
-        json_response = response.json()
-        _LOGGER.debug(f'Raw JSON response from: {json_response}')
+        _LOGGER.debug("Raw JSON response: %s", json_response)
 
         if "error" in json_response:
-            code = json_response['error'].get('code')
-            message = json_response['error'].get('message')
+            code = json_response["error"].get("code")
+            message = json_response["error"].get("message")
             if code == -32000:
-                # Object not found — expected when optional ubus objects (mwan3, etc.) aren't installed
-                _LOGGER.debug(f"api_call: ubus object not found: {message}")
+                # Object not found — expected for optional ubus objects (mwan3, etc.)
+                _LOGGER.debug("api_call: ubus object not found: %s", message)
                 raise NameError(message)
-            _LOGGER.error(f"api_call RPC error: {json_response['error']}")
+            _LOGGER.error("api_call RPC error: %s", json_response["error"])
             if code == -32002:
                 raise PermissionError(message)
             raise ConnectionError(f"RPC error: {message}")
 
-        result = json_response['result']
+        result = json_response["result"]
         if rpc_method == "list":
             return result
         result_code = result[0]
         if result_code == 8:
-            raise ConnectionError(f"RPC error: not allowed")
+            raise ConnectionError("RPC error: not allowed")
         if result_code == 6:
-            raise PermissionError(f"RPC error: insufficient permissions")
+            raise PermissionError("RPC error: insufficient permissions")
         if result_code == 0:
-            return json_response['result'][1] if len(result) > 1 else {}
+            return json_response["result"][1] if len(result) > 1 else {}
         raise ConnectionError(f"RPC error: {result[0]}")
 
-    async def api_list(self): 
-        """
-        Retrieve the list of available ubus commands.
-
-        .. deprecated::
-            This method is no longer in use. The accepted commands are obtained
-            during session initialization when the token is requested.
-
-        Returns:
-            dict: A dictionary containing all available ubus commands and their signatures.
-        """
-        _LOGGER.debug("Consult the list of available commands...")
+    async def api_list(self):
+        """Deprecated. ACLs are obtained during login instead."""
         return await self.api_call("*", None, None, "list")

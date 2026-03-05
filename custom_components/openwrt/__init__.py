@@ -5,9 +5,7 @@ from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers import service
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-)
+
 import homeassistant.helpers.config_validation as cv
 
 import voluptuous as vol
@@ -24,12 +22,12 @@ CONFIG_SCHEMA = vol.Schema({
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    data = entry.as_dict()['data']
+    hass.data.setdefault(DOMAIN, dict(devices={}))
 
-    device = new_coordinator(hass, data, hass.data[DOMAIN]['devices'])
+    device = new_coordinator(hass, entry.data, hass.data[DOMAIN]["devices"])
 
-    hass.data[DOMAIN]['devices'][entry.entry_id] = device # Backward compatibility
-    entry.runtime_data = device # New style
+    hass.data[DOMAIN]["devices"][entry.entry_id] = device
+    entry.runtime_data = device
 
     await device.coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -40,14 +38,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
+    hass.data[DOMAIN]["devices"].pop(entry.entry_id, None)
     entry.runtime_data = None
-    hass.data[DOMAIN]['devices'].pop(entry.entry_id)
 
     return True
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    hass.data[DOMAIN] = dict(devices={})
+    hass.data.setdefault(DOMAIN, dict(devices={}))
 
     async def async_reboot(call):
         for entry_id in await service.async_extract_config_entry_ids(hass, call):
@@ -58,7 +56,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         ids = await service.async_extract_config_entry_ids(hass, call)
         response = {}
         for entry_id in ids:
-            if coordinator := hass.data[DOMAIN]["devices"].get(entry_id): 
+            if coordinator := hass.data[DOMAIN]["devices"].get(entry_id):
                 if coordinator.is_api_supported("file"):
                     args = parts[1:]
                     if "arguments" in call.data:
@@ -67,7 +65,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                         parts[0],
                         args,
                         call.data.get("environment", {}),
-                        call.data.get("extra", {})
+                        call.data.get("extra", {}),
                     )
         if len(ids) == 1:
             return response.get(list(ids)[0])
@@ -78,10 +76,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         for entry_id in await service.async_extract_config_entry_ids(hass, call):
             device = hass.data[DOMAIN]["devices"][entry_id]
             if device.is_api_supported("rc"):
-                await device.do_rc_init(
-                    parts[0],
-                    call.data.get("action", {})
-                )
+                await device.do_rc_init(parts[0], call.data.get("action", {}))
 
     async def async_ubus(call):
         response = {}
@@ -105,6 +100,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+
 class OpenWrtEntity(CoordinatorEntity):
     def __init__(self, device, device_id: str):
         super().__init__(device.coordinator)
@@ -114,9 +112,7 @@ class OpenWrtEntity(CoordinatorEntity):
     @property
     def device_info(self):
         return {
-            "identifiers": {
-                ("id", self._device_id)
-            },
+            "identifiers": {("id", self._device_id)},
             "name": f"OpenWrt [{self._device_id}]",
             "model": self.data["info"]["model"],
             "manufacturer": self.data["info"]["manufacturer"],
@@ -125,11 +121,11 @@ class OpenWrtEntity(CoordinatorEntity):
 
     @property
     def name(self):
-        return "OpenWrt [%s]" % (self._device_id)
+        return "OpenWrt [%s]" % self._device_id
 
     @property
     def unique_id(self):
-        return "sensor.openwrt.%s" % (self._device_id)
+        return "sensor.openwrt.%s" % self._device_id
 
     @property
     def data(self) -> dict:

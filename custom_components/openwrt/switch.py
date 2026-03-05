@@ -6,7 +6,6 @@ from homeassistant.helpers.entity import EntityCategory
 import logging
 
 from . import OpenWrtEntity
-from .constants import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -14,16 +13,16 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities
+    async_add_entities,
 ) -> None:
-    entities = []
-    data = entry.as_dict()
-    device = hass.data[DOMAIN]['devices'][entry.entry_id]
-    device_id = data['data']['id']
-    for net_id, info in device.coordinator.data['wireless'].items():
-        if "wps" in info:
-            sensor = WirelessWpsSwitch(device, device_id, net_id)
-            entities.append(sensor)
+    device = entry.runtime_data
+    device_id = entry.data["id"]
+
+    entities = [
+        WirelessWpsSwitch(device, device_id, net_id)
+        for net_id, info in device.coordinator.data["wireless"].items()
+        if "wps" in info
+    ]
     async_add_entities(entities)
     return True
 

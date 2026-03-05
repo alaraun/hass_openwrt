@@ -20,6 +20,9 @@
           "mesh_devices": "Mesh device names (comma-separated)"
         }
       }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Check address, credentials and network."
     }
   }
 }

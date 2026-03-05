@@ -1,16 +1,12 @@
 #!/bin/sh
 
-# --- Language Selection / Selección de Idioma ---
-# Choose your preferred language for script output and comments.
-# Selecciona tu idioma preferido para la salida del script y los comentarios.
+# --- Language Selection ---
 LANG_CHOICE=""
 while [ "$LANG_CHOICE" != "es" ] && [ "$LANG_CHOICE" != "en" ]; do
     printf "Choose language (es/en): "
     read -r LANG_CHOICE
 done
 
-# Define messages based on selected language
-# Definir mensajes basados en el idioma seleccionado
 if [ "$LANG_CHOICE" = "es" ]; then
     MSG_PKG_MANAGER_NONE="*** No se encontró un gestor de paquetes compatible (opkg/apk). Se omitió la verificación de paquetes. ***"
     MSG_MISSING_PKGS="*** PAQUETES FALTANTES:"
@@ -26,8 +22,7 @@ if [ "$LANG_CHOICE" = "es" ]; then
     MSG_RPCD_RESTARTED="rpcd reiniciado."
     MSG_EXIT_MISSING="Saliendo con error porque faltan paquetes."
     MSG_EXIT_CHECK_ONLY="Verificación de paquetes completada."
-
-else # Default to English
+else
     MSG_PKG_MANAGER_NONE="*** No supported package manager found (opkg/apk). Package check skipped. ***"
     MSG_MISSING_PKGS="*** MISSING PACKAGES:"
     MSG_INSTALL_OPKG="Please install them on the OpenWrt device:\n  opkg update && opkg install"
@@ -42,73 +37,67 @@ else # Default to English
     MSG_RPCD_RESTARTED="rpcd restarted."
     MSG_EXIT_MISSING="Exiting with error due to missing packages."
     MSG_EXIT_CHECK_ONLY="Package check completed."
-
 fi
 
-# --- Main script logic / Lógica principal del script ---
-
-#"Paso 0: Detectar gestor de paquetes (opkg o apk) y verificar paquetes requeridos"
-# "Step 0: Detect package manager (opkg or apk) and check required packages"
+# --- Package detection ---
 REQUIRED_PKGS="uhttpd uhttpd-mod-ubus rpcd rpcd-mod-iwinfo"
 PKG_MANAGER="none"
 if command -v opkg >/dev/null 2>&1; then
-  PKG_MANAGER="opkg"
+    PKG_MANAGER="opkg"
 elif command -v apk >/dev/null 2>&1; then
-  PKG_MANAGER="apk"
+    PKG_MANAGER="apk"
 fi
+
+pkg_installed() {
+    if [ "$PKG_MANAGER" = "opkg" ]; then
+        # opkg list-installed always exits 0; check if output is non-empty
+        opkg list-installed "$1" 2>/dev/null | grep -q "^$1 "
+    else
+        apk info -e "$1" >/dev/null 2>&1
+    fi
+}
 
 check_packages() {
     if [ "$PKG_MANAGER" = "none" ]; then
         printf '\n\033[1;31m%s\033[0m\n\n' "$MSG_PKG_MANAGER_NONE"
-        return
+        return 0
     fi
 
     missing=""
     for pkg in $REQUIRED_PKGS; do
-        if [ "$PKG_MANAGER" = "opkg" ]; then
-            if ! opkg list-installed "$pkg" >/dev/null 2>&1; then
-                missing="$missing $pkg"
-            fi
-        else
-            if ! apk info -e "$pkg" >/dev/null 2>&1; then
-                missing="$missing $pkg"
-            fi
+        if ! pkg_installed "$pkg"; then
+            missing="$missing $pkg"
         fi
     done
 
     if [ -n "$missing" ]; then
-        # "Bloque resaltado con fondo rojo para alta visibilidad"
-		# "Highlighted block with red background for high visibility"
         printf '\n\033[1;41m%s%s ***\033[0m\n' "$MSG_MISSING_PKGS" "$missing"
         if [ "$PKG_MANAGER" = "opkg" ]; then
-            printf '\033[1;33m%s%s\033[0m\n\n' "$MSG_INSTALL_OPKG" "$missing"
+            printf '\033[1;33m%b%s\033[0m\n\n' "$MSG_INSTALL_OPKG" "$missing"
         else
-            printf '\033[1;33m%s%s\033[0m\n\n' "$MSG_INSTALL_APK" "$missing"
+            printf '\033[1;33m%b%s\033[0m\n\n' "$MSG_INSTALL_APK" "$missing"
         fi
-        return 1 # Indicate missing packages
-    else
-        #printf '\033[1;32m%s\033[0m\n' "$MSG_ALL_PKGS_INSTALLED" "$PKG_MANAGER"
-        printf '\033[1;32m%s\033[0m\n' "$(printf "$MSG_ALL_PKGS_INSTALLED" "$PKG_MANAGER")"
-		return 0 # Indicate all packages are installed
+        return 1
     fi
+
+    # shellcheck disable=SC2059
+    printf "\033[1;32m$(printf "$MSG_ALL_PKGS_INSTALLED" "$PKG_MANAGER")\033[0m\n"
+    return 0
 }
 
-# "Comprobar si se pasó el argumento --check-only"
-# "Check if --check-only argument was passed"
+# --- Entry point ---
 if [ "$1" = "--check-only" ]; then
     check_packages
     printf '\n%s\n' "$MSG_EXIT_CHECK_ONLY"
-    exit 0 # "Exit after checking packages"
+    exit 0
 fi
 
-# Run package check. Exit if packages are missing for a full setup.
 if ! check_packages; then
     printf '\n\033[1;31m%s\033[0m\n' "$MSG_EXIT_MISSING"
-    exit 1 # "Exit with error if packages are missing and it's not a check-only run"
+    exit 1
 fi
 
-# "Paso 1: Crear el archivo de permisos ACL para Home Assistant"
-# "Step 1: Create the ACL permissions file for Home Assistant"
+# Step 1: Create ACL permissions file for Home Assistant
 ACL_FILE="/usr/share/rpcd/acl.d/hass.json"
 cat << 'EOF' > "$ACL_FILE"
 {
@@ -124,9 +113,8 @@ cat << 'EOF' > "$ACL_FILE"
         "mwan3": ["status"],
         "luci-rpc": ["getHostHints"],
         "uci": ["get", "configs"]
-            },		
+      },
       "uci": ["wireless"]
-      }
     },
     "write": {
       "ubus": {
@@ -140,24 +128,20 @@ EOF
 
 printf '\033[1;32m%s\033[0m\n' "$(printf "$MSG_ACL_CREATED" "$ACL_FILE")"
 
-# "Paso 2: Crear usuario `hass` si no existe"
-# "Step 2: Create `hass` user if it doesn't exist"
+# Step 2: Create `hass` user if it doesn't exist
 if ! id "hass" >/dev/null 2>&1; then
-  printf "\033[1;33m%s\033[0m\n" "$MSG_CREATING_USER"
-
-  echo 'hass:x:10001:10001:hass:/var:/bin/false' >> /etc/passwd
-  echo 'hass:x:0:0:99999:7:::' >> /etc/shadow
-
-  printf "\033[1;33m%s\033[0m\n" "$MSG_SET_PASS"
-  passwd hass
+    printf "\033[1;33m%s\033[0m\n" "$MSG_CREATING_USER"
+    echo 'hass:x:10001:10001:hass:/var:/bin/false' >> /etc/passwd
+    echo 'hass:x:0:0:99999:7:::' >> /etc/shadow
+    printf "\033[1;33m%s\033[0m\n" "$MSG_SET_PASS"
+    passwd hass
 else
-  printf "\033[1;32m%s\033[0m\n" "$MSG_USER_EXISTS"
+    printf "\033[1;32m%s\033[0m\n" "$MSG_USER_EXISTS"
 fi
 
-# "Paso 3: Añadir configuración de login en /etc/config/rpcd si no existe ya"
-# "Step 3: Add login configuration to /etc/config/rpcd if it doesn't already exist"
+# Step 3: Add login configuration to /etc/config/rpcd if not already present
 if ! grep -q "option username 'hass'" /etc/config/rpcd; then
-  cat << 'EOF' >> /etc/config/rpcd
+    cat << 'EOF' >> /etc/config/rpcd
 
 config login
         option username 'hass'
@@ -166,12 +150,11 @@ config login
         list read 'unauthenticated'
         list write 'hass'
 EOF
-
-  printf "\033[1;33m%s\033[0m\n" "$MSG_CONFIG_ADDED"
+    printf "\033[1;33m%s\033[0m\n" "$MSG_CONFIG_ADDED"
 else
-  printf "\033[1;32m%s\033[0m\n" "$MSG_CONFIG_EXISTS"
+    printf "\033[1;32m%s\033[0m\n" "$MSG_CONFIG_EXISTS"
 fi
 
-# "Step 4: Restart rpcd"
+# Step 4: Restart rpcd
 /etc/init.d/rpcd restart
 printf "\033[1;36m%s\033[0m\n" "$MSG_RPCD_RESTARTED"
