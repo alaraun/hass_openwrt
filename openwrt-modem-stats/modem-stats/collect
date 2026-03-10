@@ -1,0 +1,169 @@
+#!/bin/sh
+# Quectel RG502Q-EA modem stats collector
+# Sends AT commands, parses responses, writes /tmp/modem-stats.json
+# Called periodically by /etc/init.d/modem-stats
+
+DEVICE="/dev/ttyUSB2"
+OUT="/tmp/modem-stats.json"
+STATIC_CACHE="/tmp/modem-stats-static.env"
+
+at() { sms_tool -d "$DEVICE" at "$1" 2>/dev/null; }
+
+# ── Static data (cached in /tmp; cleared on reboot) ───────────────────────────
+# Firmware, model, IMEI, ICCID and SIM slot never change between polls.
+# Delete /tmp/modem-stats-static.env manually to force a refresh (e.g. after SIM swap).
+if [ ! -f "$STATIC_CACHE" ]; then
+  FIRMWARE=$(at "AT+GMR" | grep -v '^AT' | grep -v '^OK' | tr -d '\r\n ')
+  MANUFACTURER=$(at "AT+CGMI" | grep -v '^AT' | grep -v '^OK' | head -1 | tr -d '\r ')
+  MODEL=$(at "AT+CGMM" | grep -v '^AT' | grep -v '^OK' | head -1 | tr -d '\r ')
+  IMEI=$(at "AT+GSN" | grep -v '^AT' | grep -v '^OK' | head -1 | tr -d '\r ')
+  ICCID=$(at "AT+QCCID" | awk -F': ' '/^\+QCCID/{gsub(/\r/,""); print $2}')
+  SIM_SLOT=$(at "AT+QUIMSLOT?" | awk -F': ' '/^\+QUIMSLOT/{gsub(/\r/,""); print $2}')
+  {
+    printf 'FIRMWARE="%s"\n'     "$(echo "$FIRMWARE"     | tr -d '"')"
+    printf 'MANUFACTURER="%s"\n' "$(echo "$MANUFACTURER" | tr -d '"')"
+    printf 'MODEL="%s"\n'        "$(echo "$MODEL"        | tr -d '"')"
+    printf 'IMEI="%s"\n'         "$(echo "$IMEI"         | tr -d '"')"
+    printf 'ICCID="%s"\n'        "$(echo "$ICCID"        | tr -d '"')"
+    printf 'SIM_SLOT="%s"\n'     "$(echo "$SIM_SLOT"     | tr -d '"')"
+  } > "$STATIC_CACHE"
+fi
+. "$STATIC_CACHE"
+
+# ── Temperature, operator, registration (single AT call) ──────────────────────
+O_DYN=$(at "at+qtemp;+qspn;+cereg=2;+cereg?")
+
+TEMP=$(echo "$O_DYN" | awk -F'[:,]' '/^.QTEMP:.*"mdm-core-usr"/{gsub(/[" \r]/,""); print $3}')
+
+eval "$(echo "$O_DYN" | awk -F',' '/^.QSPN/{
+  mcc_mnc=$5; gsub(/[" \r]/,"",mcc_mnc)
+  gsub(/[" ]/,""); sub(/.*QSPN:/,"")
+  print "OPERATOR=" $1
+  print "MCC_MNC=" mcc_mnc
+}')"
+
+eval "$(echo "$O_DYN" | awk -F',' '/^.CEREG/{
+  gsub(/[" \r]/,"")
+  print "CEREG_STAT=" $2
+  print "CEREG_TAC=" $3
+  print "CEREG_CID=" $4
+}')"
+
+REGISTERED="false"
+{ [ "$CEREG_STAT" = "1" ] || [ "$CEREG_STAT" = "5" ]; } && REGISTERED="true"
+
+TAC_DEC="" ; CID_DEC=""
+[ -n "$CEREG_TAC" ] && TAC_DEC=$(printf "%d" "0x${CEREG_TAC}" 2>/dev/null)
+[ -n "$CEREG_CID" ] && CID_DEC=$(printf "%d" "0x${CEREG_CID}" 2>/dev/null)
+
+# ── Serving cell, signal quality, carrier aggregation (single AT call) ─────────
+O_RF=$(at 'at+qeng="servingcell";+qcainfo')
+
+MODE="LTE"
+echo "$O_RF" | grep -q '"NR5G-SA"'  && MODE="5G SA"
+echo "$O_RF" | grep -q '"NR5G-NSA"' && MODE="5G NSA"
+
+# LTE: +QENG: "LTE","FDD",MCC,MNC,CID,PCI,EARFCN,band,UL_BW,DL_BW,TAC,RSRP,RSRQ,RSSI,RSSNR,...
+LTE_SINR=""
+eval "$(echo "$O_RF" | grep -F '+QENG: "LTE"' | awk -F',' '{
+  gsub(/[ \r]/,"")
+  print "LTE_PCI="    $6
+  print "LTE_EARFCN=" $7
+  print "LTE_RSRP="   $12
+  print "LTE_RSRQ="   $13
+  print "LTE_RSSI="   $14
+  print "LTE_RSSNR="  $15
+  if ($15 != "") printf "LTE_SINR=%.1f\n", 0.2*$15*10 - 20
+}')"
+
+# NR5G-NSA: +QENG: "NR5G-NSA",MCC,MNC,PCI,RSRP,SINR,RSRQ,NRARFCN,...
+eval "$(echo "$O_RF" | grep -F '+QENG: "NR5G-NSA"' | awk -F',' '{
+  gsub(/[ \r]/,"")
+  print "NR_PCI="    $4
+  print "NR_RSRP="   $5
+  print "NR_SINR="   $6
+  print "NR_RSRQ="   $7
+  print "NR_EARFCN=" $8
+}')"
+
+# ── Carrier aggregation (bands) ───────────────────────────────────────────────
+# PCC: +QCAINFO: "PCC",EARFCN,NUM_RB,"LTE BAND N",?,PCI,RSRP,RSRQ,RSSI,?
+PCC_BAND=$(echo "$O_RF" | grep -F '+QCAINFO: "PCC"' \
+  | awk -F',' '{gsub(/[" ]/,""); print $4}' | sed 's/LTEBAND/B/')
+
+# NR SCC: +QCAINFO: "SCC",NRARFCN,BW_IDX,"NR5G BAND N",PCI
+NR_BAND=$(echo "$O_RF" \
+  | awk -F',' '/^.QCAINFO:.*NR5G/{gsub(/[" ]/,""); print $4}' \
+  | sed 's/NR5GBAND/N/' | head -1)
+
+# All bands: PCC + LTE SCCs + NR SCC
+BANDS="$PCC_BAND"
+SCC_LTE=$(echo "$O_RF" \
+  | awk -F',' '/^.QCAINFO:.*"SCC".*LTE/{gsub(/[" ]/,""); print $4}' \
+  | sed 's/LTEBAND/B/' | tr '\n' '+' | sed 's/+$//')
+[ -n "$SCC_LTE" ] && BANDS="${BANDS}+${SCC_LTE}"
+[ -n "$NR_BAND" ] && BANDS="${BANDS}+${NR_BAND}"
+
+# ── Protocol detection ────────────────────────────────────────────────────────
+PROTO="mbim"
+PVCUT=$(awk -F'Vendor=2c7c ProdID=0800' '{print $2}' /sys/kernel/debug/usb/devices 2>/dev/null)
+echo "$PVCUT" | grep -q "Driver=qmi_wwan" && PROTO="qmi"
+echo "$PVCUT" | grep -q "Driver=cdc_ether" && PROTO="ecm"
+
+# ── Interface RX/TX stats ─────────────────────────────────────────────────────
+# Primary: ask OpenWrt's network daemon for the L3 device name (works for any proto)
+IFACE=$(ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@.l3_device')
+# Fallback: first wwan*/usb* netdev visible in sysfs (covers down/restarting iface)
+[ -z "$IFACE" ] && IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -E '^(wwan|usb)[0-9]' | head -1)
+
+STATS_DIR="/sys/class/net/${IFACE}/statistics"
+RX_BYTES=$(cat "${STATS_DIR}/rx_bytes" 2>/dev/null)
+TX_BYTES=$(cat "${STATS_DIR}/tx_bytes" 2>/dev/null)
+RX_PACKETS=$(cat "${STATS_DIR}/rx_packets" 2>/dev/null)
+TX_PACKETS=$(cat "${STATS_DIR}/tx_packets" 2>/dev/null)
+
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+js() { printf '"%s"' "$(echo "$1" | tr -d '"\\')"; }        # string value
+jn() { [ -n "$1" ] && printf '%s' "$1" || printf 'null'; }  # number or null
+
+# ── Write output ──────────────────────────────────────────────────────────────
+cat > "$OUT" << ENDJSON
+{
+  "timestamp": $(date +%s),
+  "registered": $REGISTERED,
+  "mode": $(js "$MODE"),
+  "operator": $(js "$OPERATOR"),
+  "mcc_mnc": $(js "$MCC_MNC"),
+  "bands": $(js "$BANDS"),
+  "pcc_band": $(js "$PCC_BAND"),
+  "nr_band": $(js "$NR_BAND"),
+  "lte_rsrp": $(jn "$LTE_RSRP"),
+  "lte_rsrq": $(jn "$LTE_RSRQ"),
+  "lte_rssi": $(jn "$LTE_RSSI"),
+  "lte_sinr": $(jn "$LTE_SINR"),
+  "lte_pci": $(jn "$LTE_PCI"),
+  "lte_earfcn": $(jn "$LTE_EARFCN"),
+  "nr_rsrp": $(jn "$NR_RSRP"),
+  "nr_rsrq": $(jn "$NR_RSRQ"),
+  "nr_sinr": $(jn "$NR_SINR"),
+  "nr_pci": $(jn "$NR_PCI"),
+  "nr_earfcn": $(jn "$NR_EARFCN"),
+  "tac_hex": $(js "$CEREG_TAC"),
+  "tac_dec": $(jn "$TAC_DEC"),
+  "cell_id_hex": $(js "$CEREG_CID"),
+  "cell_id_dec": $(jn "$CID_DEC"),
+  "temp": $(jn "$TEMP"),
+  "firmware": $(js "$FIRMWARE"),
+  "model": $(js "$MODEL"),
+  "manufacturer": $(js "$MANUFACTURER"),
+  "imei": $(js "$IMEI"),
+  "iccid": $(js "$ICCID"),
+  "sim_slot": $(jn "$SIM_SLOT"),
+  "proto": $(js "$PROTO"),
+  "iface": $(js "$IFACE"),
+  "rx_bytes": $(jn "$RX_BYTES"),
+  "tx_bytes": $(jn "$TX_BYTES"),
+  "rx_packets": $(jn "$RX_PACKETS"),
+  "tx_packets": $(jn "$TX_PACKETS")
+}
+ENDJSON

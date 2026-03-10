@@ -33,6 +33,10 @@ class WirelessWpsSwitch(OpenWrtEntity, SwitchEntity):
         self._interface_id = interface
 
     @property
+    def available(self) -> bool:
+        return self._interface_id in self.data.get("wireless", {})
+
+    @property
     def unique_id(self):
         return "%s.%s.wps" % (super().unique_id, self._interface_id)
 
@@ -42,15 +46,14 @@ class WirelessWpsSwitch(OpenWrtEntity, SwitchEntity):
 
     @property
     def is_on(self):
-        return self.data["wireless"][self._interface_id]["wps"]
+        iface = self.data.get("wireless", {}).get(self._interface_id, {})
+        return iface.get("wps", False)
 
     async def async_turn_on(self, **kwargs):
         await self._device.set_wps(self._interface_id, True)
-        self.data["wireless"][self._interface_id]["wps"] = True
 
     async def async_turn_off(self, **kwargs):
         await self._device.set_wps(self._interface_id, False)
-        self.data["wireless"][self._interface_id]["wps"] = False
 
     @property
     def icon(self):

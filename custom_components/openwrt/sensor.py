@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 
 import logging
 
 from . import OpenWrtEntity
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,8 +73,69 @@ async def async_setup_entry(
         entities.append(SystemMemorySensor(device, device_id))
         if device.coordinator.data["system_info"].get("swap", {}).get("total", 0) > 0:
             entities.append(SystemDiskSensor(device, device_id, "swap"))
+        if device.coordinator.data["system_info"].get("root", {}).get("total", 0) > 0:
+            entities.append(SystemDiskSensor(device, device_id, "root"))
+        if device.coordinator.data["system_info"].get("tmp", {}).get("total", 0) > 0:
+            entities.append(SystemDiskSensor(device, device_id, "tmp"))
+
+    if device.coordinator.data.get("modem"):
+        entities.append(ModemModeSensor(device, device_id))
+        entities.append(ModemSignalSensor(device, device_id, "lte_rsrp", "LTE RSRP", "dBm", SensorDeviceClass.SIGNAL_STRENGTH))
+        entities.append(ModemSignalSensor(device, device_id, "lte_rsrq", "LTE RSRQ", "dB", None))
+        entities.append(ModemSignalSensor(device, device_id, "lte_rssi", "LTE RSSI", "dBm", SensorDeviceClass.SIGNAL_STRENGTH))
+        entities.append(ModemSignalSensor(device, device_id, "lte_sinr", "LTE SINR", "dB", None))
+        entities.append(ModemSignalSensor(device, device_id, "nr_rsrp", "NR RSRP", "dBm", SensorDeviceClass.SIGNAL_STRENGTH))
+        entities.append(ModemSignalSensor(device, device_id, "nr_rsrq", "NR RSRQ", "dB", None))
+        entities.append(ModemSignalSensor(device, device_id, "nr_sinr", "NR SINR", "dB", None))
+        entities.append(ModemSignalSensor(device, device_id, "temp", "Modem temp", "°C", SensorDeviceClass.TEMPERATURE))
+        entities.append(ModemTrafficSensor(device, device_id, "rx_bytes", "RX bytes", "B", SensorDeviceClass.DATA_SIZE))
+        entities.append(ModemTrafficSensor(device, device_id, "tx_bytes", "TX bytes", "B", SensorDeviceClass.DATA_SIZE))
+        entities.append(ModemTrafficSensor(device, device_id, "rx_packets", "RX packets", "packets", None))
+        entities.append(ModemTrafficSensor(device, device_id, "tx_packets", "TX packets", "packets", None))
+        entities.append(ModemTimestampSensor(device, device_id))
 
     async_add_entities(entities)
+
+    # --- Dynamic entity tracking ---
+    # Track which wireless/mesh interface IDs were registered at setup time.
+    _known_wireless_ids: set[str] = set(net_id for net_id in device.coordinator.data["wireless"])
+    _known_mesh_ids: set[str] = set(net_id for net_id in device.coordinator.data["mesh"])
+    # _all_wireless_sensors is the same list object passed to WirelessTotalClientsSensor,
+    # so appending here is automatically reflected in that sensor's .state sum.
+    _all_wireless_sensors = wireless
+
+    @callback
+    def _on_coordinator_update() -> None:
+        current_wireless = set(device.coordinator.data.get("wireless", {}).keys())
+        current_mesh = set(device.coordinator.data.get("mesh", {}).keys())
+
+        # New wireless interfaces
+        new_wireless_ids = current_wireless - _known_wireless_ids
+        if new_wireless_ids:
+            new_wireless_sensors = []
+            for net_id in new_wireless_ids:
+                sensor = WirelessClientsSensor(device, device_id, net_id)
+                _all_wireless_sensors.append(sensor)
+                new_wireless_sensors.append(sensor)
+                _known_wireless_ids.add(net_id)
+            async_add_entities(new_wireless_sensors)
+
+        # New mesh interfaces
+        new_mesh_ids = current_mesh - _known_mesh_ids
+        if new_mesh_ids:
+            new_mesh_sensors = []
+            for net_id in new_mesh_ids:
+                new_mesh_sensors.append(MeshSignalSensor(device, device_id, net_id))
+                new_mesh_sensors.append(MeshPeersSensor(device, device_id, net_id))
+                _known_mesh_ids.add(net_id)
+            async_add_entities(new_mesh_sensors)
+
+        # Gone wireless/mesh — entities become unavailable automatically because
+        # WirelessClientsSensor.available, MeshSignalSensor.available, and
+        # MeshPeersSensor.available all check key presence in coordinator data.
+
+    device.coordinator.async_add_listener(_on_coordinator_update)
+
     return True
 
 
@@ -97,17 +158,27 @@ class WirelessClientsSensor(OpenWrtSensor):
         self._interface_id = interface
 
     @property
+    def interface_id(self) -> str:
+        return self._interface_id
+
+    @property
+    def available(self) -> bool:
+        return self._interface_id in self.data.get("wireless", {})
+
+    @property
     def unique_id(self):
         return "%s.%s.clients" % (super().unique_id, self._interface_id)
 
     @property
     def name(self):
-        ssid = self.data["wireless"][self._interface_id].get("ssid", self._interface_id)
+        iface_data = self.data.get("wireless", {}).get(self._interface_id, {})
+        ssid = iface_data.get("ssid", self._interface_id)
         return "%s Wireless [%s] clients" % (super().name, ssid)
 
     @property
     def state(self):
-        return self.data["wireless"][self._interface_id]["clients"]
+        iface_data = self.data.get("wireless", {}).get(self._interface_id, {})
+        return iface_data.get("clients", 0)
 
     @property
     def icon(self):
@@ -116,8 +187,8 @@ class WirelessClientsSensor(OpenWrtSensor):
     @property
     def extra_state_attributes(self):
         result = dict()
-        data = self.data["wireless"][self._interface_id]
-        _LOGGER.debug("Generando atributos para %s con datos: %s", self._interface_id, data)
+        data = self.data.get("wireless", {}).get(self._interface_id, {})
+        _LOGGER.debug("Generating attributes for %s with data: %s", self._interface_id, data)
 
         hosts_data = self.data.get("hosts", {})
         mac_to_ip = {}
@@ -134,7 +205,7 @@ class WirelessClientsSensor(OpenWrtSensor):
             if mac_lower in mac_to_ip and mac_to_ip[mac_lower]:
                 client_info += f" | IP: {mac_to_ip[mac_lower]}"
             if mac_lower in mac_to_name and mac_to_name[mac_lower]:
-                client_info += f" | Nombre: {mac_to_name[mac_lower]}"
+                client_info += f" | Name: {mac_to_name[mac_lower]}"
             result[mac.upper()] = client_info
 
         if "ssid" in data:
@@ -154,6 +225,10 @@ class MeshSignalSensor(OpenWrtSensor):
         self._interface_id = interface
 
     @property
+    def available(self) -> bool:
+        return self._interface_id in self.data.get("mesh", {})
+
+    @property
     def unique_id(self):
         return "%s.%s.mesh_signal" % (super().unique_id, self._interface_id)
 
@@ -163,7 +238,7 @@ class MeshSignalSensor(OpenWrtSensor):
 
     @property
     def native_value(self):
-        return self.data["mesh"][self._interface_id]["signal"]
+        return self.data.get("mesh", {}).get(self._interface_id, {}).get("signal", None)
 
     @property
     def native_unit_of_measurement(self):
@@ -207,6 +282,10 @@ class MeshPeersSensor(OpenWrtSensor):
         self._interface_id = interface
 
     @property
+    def available(self) -> bool:
+        return self._interface_id in self.data.get("mesh", {})
+
+    @property
     def unique_id(self):
         return "%s.%s.mesh_peers" % (super().unique_id, self._interface_id)
 
@@ -216,8 +295,8 @@ class MeshPeersSensor(OpenWrtSensor):
 
     @property
     def state(self):
-        peers = self.data["mesh"][self._interface_id]["peers"]
-        return len([p for p in peers.values() if p["active"]])
+        peers = self.data.get("mesh", {}).get(self._interface_id, {}).get("peers", {})
+        return len([p for p in peers.values() if p.get("active")])
 
     @property
     def icon(self):
@@ -226,7 +305,7 @@ class MeshPeersSensor(OpenWrtSensor):
     @property
     def extra_state_attributes(self):
         result = dict()
-        data = self.data["mesh"][self._interface_id]
+        data = self.data.get("mesh", {}).get(self._interface_id, {})
         for key, value in data.get("peers", {}).items():
             signal = value.get("signal", 0)
             result[key.upper()] = f"{signal} dBm"
@@ -254,7 +333,7 @@ class WirelessTotalClientsSensor(OpenWrtSensor):
 
     @property
     def state(self):
-        return sum(s.state for s in self._sensors)
+        return sum(s.state for s in self._sensors if s.available)
 
     @property
     def icon(self):
@@ -264,8 +343,10 @@ class WirelessTotalClientsSensor(OpenWrtSensor):
     def extra_state_attributes(self):
         result = {}
         for sensor in self._sensors:
-            ssid = sensor.data["wireless"][sensor._interface_id].get(
-                "ssid", sensor._interface_id
+            if not sensor.available:
+                continue
+            ssid = sensor.data["wireless"][sensor.interface_id].get(
+                "ssid", sensor.interface_id
             )
             result[ssid] = sensor.state
         return result
@@ -373,7 +454,7 @@ class HostsSensor(OpenWrtSensor):
         result = {}
         for ip in sorted(ip_to_host.keys(), key=self._sort_ip):
             host_info = ip_to_host[ip]
-            name = host_info["name"] if host_info["name"] else "Desconocido"
+            name = host_info["name"] if host_info["name"] else "Unknown"
             result[ip] = f"{name} : {host_info['mac']}"
         return result
 
@@ -530,3 +611,218 @@ class SystemDiskSensor(OpenWrtSensor):
             "used_kb": disk_info.get("used", 0),
             "avail_kb": disk_info.get("avail", 0),
         }
+
+
+def _epoch_to_iso(ts) -> str | None:
+    """Convert a Unix epoch int to an ISO-8601 string, or None."""
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+class ModemModeSensor(OpenWrtSensor):
+    """Current connection mode (LTE / 5G NSA / 5G SA) with all modem stats as attributes."""
+
+    def __init__(self, device, device_id: str):
+        super().__init__(device, device_id)
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_icon = "mdi:signal-5g"
+
+    @property
+    def state_class(self):
+        return None
+
+    @property
+    def _modem(self) -> dict:
+        return self.data.get("modem", {})
+
+    @property
+    def available(self):
+        return bool(self._modem)
+
+    @property
+    def unique_id(self):
+        return f"{super().unique_id}.modem_mode"
+
+    @property
+    def name(self):
+        return f"{super().name} Modem mode"
+
+    @property
+    def native_value(self):
+        return self._modem.get("mode")
+
+    @property
+    def extra_state_attributes(self):
+        m = self._modem
+        return {
+            "operator": m.get("operator"),
+            "mcc_mnc": m.get("mcc_mnc"),
+            "bands": m.get("bands"),
+            "pcc_band": m.get("pcc_band"),
+            "nr_band": m.get("nr_band"),
+            "registered": m.get("registered"),
+            "tac_hex": m.get("tac_hex"),
+            "tac_dec": m.get("tac_dec"),
+            "cell_id_hex": m.get("cell_id_hex"),
+            "cell_id_dec": m.get("cell_id_dec"),
+            "lte_pci": m.get("lte_pci"),
+            "lte_earfcn": m.get("lte_earfcn"),
+            "nr_pci": m.get("nr_pci"),
+            "nr_earfcn": m.get("nr_earfcn"),
+            "firmware": m.get("firmware"),
+            "model": m.get("model"),
+            "manufacturer": m.get("manufacturer"),
+            "imei": m.get("imei"),
+            "iccid": m.get("iccid"),
+            "sim_slot": m.get("sim_slot"),
+            "proto": m.get("proto"),
+            "iface": m.get("iface"),
+            "last_update": _epoch_to_iso(m.get("timestamp")),
+        }
+
+
+class ModemSignalSensor(OpenWrtSensor):
+    """Single numeric modem signal metric (RSRP, RSRQ, SINR, temp, ...)."""
+
+    def __init__(self, device, device_id: str, key: str, label: str, unit: str, device_class):
+        super().__init__(device, device_id)
+        self._key = key
+        self._label = label
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_icon = "mdi:thermometer" if "temp" in key else None
+
+    @property
+    def _modem(self) -> dict:
+        return self.data.get("modem", {})
+
+    @property
+    def available(self):
+        return bool(self._modem) and self._modem.get(self._key) is not None
+
+    @property
+    def unique_id(self):
+        return f"{super().unique_id}.modem_{self._key}"
+
+    @property
+    def name(self):
+        return f"{super().name} Modem {self._label}"
+
+    @property
+    def icon(self):
+        if self._attr_icon:  # thermometer
+            return self._attr_icon
+        val = self.native_value
+        if val is None:
+            return "mdi:signal-cellular-outline"
+        if "rsrp" in self._key:
+            # RSRP: strong >= -80, medium >= -100, low < -100 dBm
+            level = 3 if val >= -80 else 2 if val >= -100 else 1
+        elif "rsrq" in self._key:
+            # RSRQ: strong >= -10, medium >= -15, low < -15 dB
+            level = 3 if val >= -10 else 2 if val >= -15 else 1
+        elif "rssi" in self._key:
+            # RSSI: strong >= -65, medium >= -95, low < -95 dBm
+            level = 3 if val >= -65 else 2 if val >= -95 else 1
+        else:
+            # SINR: strong >= 10, medium >= 3, low < 3 dB
+            level = 3 if val >= 10 else 2 if val >= 3 else 1
+        return f"mdi:signal-cellular-{level}"
+
+    @property
+    def native_value(self):
+        val = self._modem.get(self._key)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+
+class ModemTrafficSensor(OpenWrtSensor):
+    """Cumulative RX/TX byte or packet counter for the modem interface."""
+
+    def __init__(self, device, device_id: str, key: str, label: str, unit: str, device_class):
+        super().__init__(device, device_id)
+        self._key = key
+        self._label = label
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_icon = "mdi:download-network" if key.startswith("rx") else "mdi:upload-network"
+
+    @property
+    def state_class(self):
+        return "total_increasing"
+
+    @property
+    def _modem(self) -> dict:
+        return self.data.get("modem", {})
+
+    @property
+    def available(self):
+        return bool(self._modem) and self._modem.get(self._key) is not None
+
+    @property
+    def unique_id(self):
+        return f"{super().unique_id}.modem_{self._key}"
+
+    @property
+    def name(self):
+        return f"{super().name} Modem {self._label}"
+
+    @property
+    def native_value(self):
+        val = self._modem.get(self._key)
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+
+class ModemTimestampSensor(OpenWrtSensor):
+    """Timestamp of the last modem stats collection run."""
+
+    def __init__(self, device, device_id: str):
+        super().__init__(device, device_id)
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_device_class = SensorDeviceClass.TIMESTAMP
+        self._attr_icon = "mdi:clock-outline"
+
+    @property
+    def state_class(self):
+        return None  # timestamps have no state_class
+
+    @property
+    def _modem(self) -> dict:
+        return self.data.get("modem", {})
+
+    @property
+    def available(self):
+        return bool(self._modem)
+
+    @property
+    def unique_id(self):
+        return f"{super().unique_id}.modem_timestamp"
+
+    @property
+    def name(self):
+        return f"{super().name} Modem last update"
+
+    @property
+    def native_value(self):
+        ts = self._modem.get("timestamp")
+        if ts is None:
+            return None
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        except (TypeError, ValueError):
+            return None

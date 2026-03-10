@@ -1,0 +1,317 @@
+title: 5G Modem
+views:
+  - title: 5G Modem
+    path: modem
+    icon: mdi:signal-5g
+    type: sections
+    sections:
+
+      # ── Connection status & SIM ────────────────────────────────────────────────
+      - type: grid
+        cards:
+          - type: entities
+            title: Connection
+            grid_options:
+              columns: 2
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_mode
+                name: Mode
+              - entity: binary_sensor.openwrt_pagan_gw_modem_registered
+                name: Registered
+              - entity: sensor.openwrt_pagan_gw_modem_last_update
+                name: Last update
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: operator
+                name: Operator
+                icon: mdi:office-building-outline
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: mcc_mnc
+                name: MCC/MNC
+                icon: mdi:identifier
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: bands
+                name: CA Bands
+                icon: mdi:radio-tower
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: pcc_band
+                name: PCC Band
+                icon: mdi:antenna
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: nr_band
+                name: NR Band
+                icon: mdi:antenna
+
+          - type: entities
+            title: SIM & Device
+            grid_options:
+              columns: 2
+            entities:
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: sim_slot
+                name: SIM Slot
+                icon: mdi:sim
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: iccid
+                name: ICCID
+                icon: mdi:card-account-details-outline
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: model
+                name: Model
+                icon: mdi:chip
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: manufacturer
+                name: Manufacturer
+                icon: mdi:factory
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: firmware
+                name: Firmware
+                icon: mdi:update
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: proto
+                name: Protocol
+                icon: mdi:connection
+              - entity: sensor.openwrt_pagan_gw_modem_modem_temp
+                name: Modem Temp
+
+      # ── Cell identity ──────────────────────────────────────────────────────────
+      - type: grid
+        cards:
+          - type: entities
+            title: Cell Identity
+            grid_options:
+              columns: 4
+            entities:
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: tac_dec
+                name: TAC
+                icon: mdi:map-marker-radius-outline
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: cell_id_dec
+                name: Cell ID
+                icon: mdi:antenna
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: lte_pci
+                name: LTE PCI
+                icon: mdi:numeric
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: lte_earfcn
+                name: LTE EARFCN
+                icon: mdi:sine-wave
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: nr_pci
+                name: NR PCI
+                icon: mdi:numeric
+              - type: attribute
+                entity: sensor.openwrt_pagan_gw_modem_mode
+                attribute: nr_earfcn
+                name: NR ARFCN
+                icon: mdi:sine-wave
+
+      # ── Current signal quality (bars) ────────────────────────────────────────
+      # Requires HACS: custom:bar-card
+      - type: grid
+        title: Signal Quality
+        cards:
+          - type: tile
+            entity: sensor.openwrt_pagan_gw_modem_lte_rssi
+            name: Signal Strength
+            grid_options:
+              columns: 4
+            icon: mdi:signal
+            color: >-
+              {% set v = states('sensor.openwrt_pagan_gw_modem_lte_rssi') | int(-999) %}
+              {% if v >= -70 %} green
+              {% elif v >= -85 %} yellow
+              {% elif v >= -100 %} orange
+              {% else %} red
+              {% endif %}
+
+          - type: custom:bar-card
+            title: RSRP (dBm)
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_lte_rsrp
+                name: LTE
+                min: -140
+                max: -44
+                severity:
+                  - value: -100
+                    color: var(--error-color)
+                  - value: -80
+                    color: var(--warning-color)
+                  - value: -44
+                    color: var(--success-color)
+              - entity: sensor.openwrt_pagan_gw_modem_nr_rsrp
+                name: NR
+                min: -140
+                max: -44
+                severity:
+                  - value: -100
+                    color: var(--error-color)
+                  - value: -80
+                    color: var(--warning-color)
+                  - value: -44
+                    color: var(--success-color)
+          - type: custom:bar-card
+            title: SINR (dB)
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_lte_sinr
+                name: LTE
+                min: -20
+                max: 30
+                severity:
+                  - value: 3
+                    color: var(--error-color)
+                  - value: 10
+                    color: var(--warning-color)
+                  - value: 30
+                    color: var(--success-color)
+              - entity: sensor.openwrt_pagan_gw_modem_nr_sinr
+                name: NR
+                min: -20
+                max: 30
+                severity:
+                  - value: 3
+                    color: var(--error-color)
+                  - value: 10
+                    color: var(--warning-color)
+                  - value: 30
+                    color: var(--success-color)
+          - type: custom:bar-card
+            title: RSRQ / Temp
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_lte_rsrq
+                name: RSRQ (dB)
+                min: -20
+                max: -3
+                severity:
+                  - value: -15
+                    color: var(--error-color)
+                  - value: -10
+                    color: var(--warning-color)
+                  - value: -3
+                    color: var(--success-color)
+              - entity: sensor.openwrt_pagan_gw_modem_modem_temp
+                name: Temp (°C)
+                min: 0
+                max: 80
+                severity:
+                  - value: 50
+                    color: var(--success-color)
+                  - value: 65
+                    color: var(--warning-color)
+                  - value: 80
+                    color: var(--error-color)
+
+      # ── Mobile data traffic ───────────────────────────────────────────────────
+      - type: grid
+        title: Mobile Traffic
+        cards:
+          - type: tile
+            entity: sensor.openwrt_pagan_gw_modem_rx_bytes
+            name: RX Total
+            grid_options:
+              columns: 2
+            icon: mdi:download-network
+            color: blue
+          - type: tile
+            entity: sensor.openwrt_pagan_gw_modem_tx_bytes
+            name: TX Total
+            grid_options:
+              columns: 2
+            icon: mdi:upload-network
+            color: green
+          - type: tile
+            entity: sensor.openwrt_pagan_gw_modem_rx_packets
+            name: RX Packets
+            grid_options:
+              columns: 2
+            icon: mdi:download-network-outline
+            color: blue
+          - type: tile
+            entity: sensor.openwrt_pagan_gw_modem_tx_packets
+            name: TX Packets
+            grid_options:
+              columns: 2
+            icon: mdi:upload-network-outline
+            color: green
+          - type: statistics-graph
+            title: Daily traffic
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_rx_bytes
+                name: RX
+              - entity: sensor.openwrt_pagan_gw_modem_tx_bytes
+                name: TX
+            chart_type: bar
+            period: day
+            days_to_show: 30
+            stat_types:
+              - change
+
+      # ── Long-term signal history (bar charts) ─────────────────────────────────
+      - type: grid
+        title: Signal History
+        cards:
+          - type: statistics-graph
+            title: RSRP — 30 day history
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_lte_rsrp
+                name: LTE RSRP
+              - entity: sensor.openwrt_pagan_gw_modem_nr_rsrp
+                name: NR RSRP
+            chart_type: bar
+            period: day
+            days_to_show: 30
+            stat_types:
+              - mean
+          - type: statistics-graph
+            title: SINR — 30 day history
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_lte_sinr
+                name: LTE SINR
+              - entity: sensor.openwrt_pagan_gw_modem_nr_sinr
+                name: NR SINR
+            chart_type: bar
+            period: day
+            days_to_show: 30
+            stat_types:
+              - mean
+          - type: statistics-graph
+            title: LTE RSRQ — 30 day history
+            grid_options:
+              columns: 4
+            entities:
+              - entity: sensor.openwrt_pagan_gw_modem_lte_rsrq
+                name: LTE RSRQ
+            chart_type: bar
+            period: day
+            days_to_show: 30
+            stat_types:
+              - mean

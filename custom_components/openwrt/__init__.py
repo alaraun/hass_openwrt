@@ -22,11 +22,8 @@ CONFIG_SCHEMA = vol.Schema({
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    hass.data.setdefault(DOMAIN, dict(devices={}))
+    device = new_coordinator(hass, entry.data)
 
-    device = new_coordinator(hass, entry.data, hass.data[DOMAIN]["devices"])
-
-    hass.data[DOMAIN]["devices"][entry.entry_id] = device
     entry.runtime_data = device
 
     await device.coordinator.async_config_entry_first_refresh()
@@ -38,58 +35,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    hass.data[DOMAIN]["devices"].pop(entry.entry_id, None)
     entry.runtime_data = None
 
     return True
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    hass.data.setdefault(DOMAIN, dict(devices={}))
 
     async def async_reboot(call):
-        for entry_id in await service.async_extract_config_entry_ids(hass, call):
-            await hass.data[DOMAIN]["devices"][entry_id].do_reboot()
+        for entry_id in await service.async_extract_config_entry_ids(call):
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if entry and entry.runtime_data:
+                await entry.runtime_data.do_reboot()
 
     async def async_exec(call):
         parts = call.data["command"].split(" ")
-        ids = await service.async_extract_config_entry_ids(hass, call)
+        ids = await service.async_extract_config_entry_ids(call)
         response = {}
         for entry_id in ids:
-            if coordinator := hass.data[DOMAIN]["devices"].get(entry_id):
-                if coordinator.is_api_supported("file"):
-                    args = parts[1:]
-                    if "arguments" in call.data:
-                        args = call.data["arguments"].strip().split("\n")
-                    response[entry_id] = await coordinator.do_file_exec(
-                        parts[0],
-                        args,
-                        call.data.get("environment", {}),
-                        call.data.get("extra", {}),
-                    )
+            entry = hass.config_entries.async_get_entry(entry_id)
+            coordinator = entry.runtime_data if entry else None
+            if coordinator and coordinator.is_api_supported("file"):
+                args = parts[1:]
+                if "arguments" in call.data:
+                    args = call.data["arguments"].strip().split("\n")
+                response[entry_id] = await coordinator.do_file_exec(
+                    parts[0],
+                    args,
+                    call.data.get("environment", {}),
+                    call.data.get("extra", {}),
+                )
         if len(ids) == 1:
-            return response.get(list(ids)[0])
+            return response.get(list(ids)[0]) or {}
         return response
 
     async def async_init(call):
         parts = call.data["name"].split(" ")
-        for entry_id in await service.async_extract_config_entry_ids(hass, call):
-            device = hass.data[DOMAIN]["devices"][entry_id]
-            if device.is_api_supported("rc"):
+        for entry_id in await service.async_extract_config_entry_ids(call):
+            entry = hass.config_entries.async_get_entry(entry_id)
+            device = entry.runtime_data if entry else None
+            if device and device.is_api_supported("rc"):
                 await device.do_rc_init(parts[0], call.data.get("action", {}))
 
     async def async_ubus(call):
         response = {}
-        ids = await service.async_extract_config_entry_ids(hass, call)
+        ids = await service.async_extract_config_entry_ids(call)
         for entry_id in ids:
-            if coordinator := hass.data[DOMAIN]["devices"].get(entry_id):
+            entry = hass.config_entries.async_get_entry(entry_id)
+            coordinator = entry.runtime_data if entry else None
+            if coordinator:
                 response[entry_id] = await coordinator.do_ubus_call(
                     call.data.get("subsystem"),
                     call.data.get("method"),
                     call.data.get("parameters", {}),
                 )
         if len(ids) == 1:
-            return response.get(list(ids)[0])
+            return response.get(list(ids)[0]) or {}
         return response
 
     hass.services.async_register(DOMAIN, "reboot", async_reboot)

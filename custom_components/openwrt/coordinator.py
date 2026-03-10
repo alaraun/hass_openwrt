@@ -17,14 +17,16 @@ _LOGGER = logging.getLogger(__name__)
 
 class DeviceCoordinator:
 
-    def __init__(self, hass, config: dict, ubus: Ubus, all_devices: dict):
+    def __init__(self, hass, config: dict, ubus: Ubus):
         self._config = config
         self._ubus = ubus
-        self._all_devices = all_devices
+        self._hass = hass
         self._id = config["id"]
         self._apis = None
         self._wps = config.get("wps", False)
         self._wireless_via_uci = False  # True after network.wireless status fails (OpenWrt 25.12 bug)
+        self._cached_board_info: dict | None = None
+        self._last_uptime: int = 0
 
         self._coordinator = DataUpdateCoordinator(
             hass,
@@ -130,6 +132,7 @@ class DeviceCoordinator:
                         _LOGGER.debug("mesh_id not found for %s", ifname)
                     result["mesh"].append(conf)
 
+        # optional subsystem — uci.get may not be present; catch all to keep wireless discovery alive
         except Exception as err:
             _LOGGER.warning(
                 "Device [%s] doesn't support wireless (uci get) or parse failed: %s",
@@ -153,9 +156,11 @@ class DeviceCoordinator:
                     if "ifname" not in iface:
                         _LOGGER.debug("iface %s has no ifname", iface)
                         continue
+                    network_list = iface["config"].get("network", [])
+                    network = network_list[0] if network_list else ""
                     conf = dict(
                         ifname=iface["ifname"],
-                        network=iface["config"]["network"][0],
+                        network=network,
                     )
                     if iface["config"]["mode"] == "ap":
                         ssid = iface["config"].get("ssid")
@@ -170,7 +175,12 @@ class DeviceCoordinator:
                             continue
                         result["ap"].append(conf)
                     if iface["config"]["mode"] == "mesh":
-                        conf["mesh_id"] = iface["config"]["mesh_id"]
+                        config = iface["config"]
+                        mesh_id = config.get("mesh_id")
+                        if mesh_id:
+                            conf["mesh_id"] = mesh_id
+                        else:
+                            _LOGGER.debug("mesh_id not found for %s", iface["ifname"])
                         result["mesh"].append(conf)
         except NameError as err:
             _LOGGER.warning("Device [%s] doesn't support wireless: %s", self._id, err)
@@ -178,7 +188,10 @@ class DeviceCoordinator:
 
     def find_mesh_peers(self, mesh_id: str):
         result = []
-        for _, device in self._all_devices.items():
+        for entry in self._hass.config_entries.async_entries(DOMAIN):
+            device = entry.runtime_data
+            if not device:
+                continue
             data = device.coordinator.data
             if not data or "mesh" not in data or not data["mesh"]:
                 _LOGGER.warning("Missing or invalid 'mesh' data for device: %s", device)
@@ -213,20 +226,26 @@ class DeviceCoordinator:
                     bitrate=info.get("bitrate", -1),
                     peers=peers,
                 )
-                for mac in self.find_mesh_peers(conf["mesh_id"]):
-                    try:
-                        assoc = await self._ubus.api_call(
-                            "iwinfo", "assoclist", dict(device=conf["ifname"], mac=mac)
-                        )
-                        peers[mac] = dict(
-                            active=assoc.get("mesh plink") == "ESTAB",
-                            signal=assoc.get("signal", -100),
-                            noise=assoc.get("noise", 0),
-                        )
-                    except ConnectionError:
+                peer_macs = self.find_mesh_peers(conf["mesh_id"])
+                tasks = [
+                    self._ubus.api_call(
+                        "iwinfo", "assoclist", dict(device=conf["ifname"], mac=mac)
+                    )
+                    for mac in peer_macs
+                ]
+                assoc_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for mac, assoc in zip(peer_macs, assoc_results):
+                    if isinstance(assoc, Exception):
                         _LOGGER.warning(
-                            "Failed to get assoclist for %s on device %s", mac, conf["ifname"]
+                            "Failed to get assoclist for peer %s on %s: %s",
+                            mac, conf["ifname"], assoc,
                         )
+                        continue
+                    peers[mac] = dict(
+                        active=assoc.get("mesh plink") == "ESTAB",
+                        signal=assoc.get("signal", -100),
+                        noise=assoc.get("noise", 0),
+                    )
         except ConnectionError as err:
             _LOGGER.warning("Device [%s] doesn't support iwinfo: %s", self._id, err)
         return result
@@ -266,7 +285,7 @@ class DeviceCoordinator:
         except NameError as e:
             _LOGGER.warning("Could not find object for interface %s: %s", interface_id, e)
             return {}
-        except Exception as e:
+        except (ConnectionError, KeyError, ValueError, TimeoutError) as e:
             _LOGGER.error("Error updating hostapd clients for %s: %s", interface_id, e)
             return {}
 
@@ -307,7 +326,7 @@ class DeviceCoordinator:
                 parsed = json_loads(data)
                 if isinstance(parsed, (list, dict)):
                     return parsed
-            except Exception:
+            except Exception:  # json parse fallback — non-JSON exec output is valid; silently ignore
                 pass
             return data.strip().split("\n")
 
@@ -348,7 +367,7 @@ class DeviceCoordinator:
                 clients_info = await self.update_hostapd_clients(ifname)
                 clients_info["ssid"] = item.get("ssid", ifname)
                 result[ifname] = clients_info
-            except Exception as e:
+            except (ConnectionError, KeyError, ValueError) as e:
                 _LOGGER.error("Error updating AP for %s: %s", ifname, e)
         return result
 
@@ -420,8 +439,34 @@ class DeviceCoordinator:
                     "mac": mac,
                 }
             return hosts
+        # optional subsystem — luci-rpc may not be installed; swallow all errors to keep the poll alive
         except Exception as err:
             _LOGGER.warning("Failed to get host hints for device [%s]: %s", self._id, err)
+            return {}
+
+    async def update_modem_stats(self) -> dict:
+        """Read modem stats from /tmp/modem-stats.json via the file ubus object."""
+        if not self.is_api_supported("file", "read"):
+            return {}
+        try:
+            response = await self._ubus.api_call(
+                "file", "read", {"path": "/tmp/modem-stats.json"}
+            )
+        except ConnectionError as err:
+            _LOGGER.debug(
+                "Modem stats file not available on device [%s]: %s", self._id, err
+            )
+            return {}
+        data_str = response.get("data", "")
+        if not data_str:
+            return {}
+        try:
+            return json_loads(data_str)
+        except (ValueError, KeyError) as err:
+            _LOGGER.warning(
+                "Device [%s] modem-stats.json is malformed (partial write?): %s",
+                self._id, err,
+            )
             return {}
 
     async def update_system_info(self):
@@ -438,6 +483,7 @@ class DeviceCoordinator:
                 "tmp": response.get("tmp", {}),
                 "swap": response.get("swap", {}),
             }
+        # semi-optional — system.info failure is non-fatal; uptime falls back to 0 (no reboot assumed)
         except Exception as err:
             _LOGGER.warning("Device [%s] failed to get system info: %s", self._id, err)
             return {}
@@ -449,7 +495,8 @@ class DeviceCoordinator:
         if not self._ubus.acls:
             _LOGGER.debug("ACLs not loaded yet, performing login to obtain ACLs")
             try:
-                await self._ubus._login()
+                await self._ubus.login()
+            # login can raise ubus auth errors, network errors, or unexpected server responses; all are non-fatal here
             except Exception as err:
                 _LOGGER.error("Failed to login and load ACLs: %s", err)
                 return {}
@@ -474,6 +521,7 @@ class DeviceCoordinator:
             _LOGGER.debug("Using ubus network.wireless for wireless discovery")
             try:
                 return await self.discover_wireless()
+            # triggers permanent UCI fallback; must catch ubus RPC errors and OpenWrt 25.12 rpcd protocol errors
             except Exception as err:
                 _LOGGER.warning(
                     "discover_wireless failed, switching permanently to UCI fallback "
@@ -484,6 +532,7 @@ class DeviceCoordinator:
         _LOGGER.debug("Using UCI (uci get wireless) for wireless discovery")
         try:
             return await self.discover_wireless_uci()
+        # last-resort fallback — catch all discovery errors; returning empty config is safer than crashing the poll
         except Exception as err:
             _LOGGER.warning("discover_wireless_uci failed: %s", err)
         return dict(ap=[], mesh=[])
@@ -497,21 +546,41 @@ class DeviceCoordinator:
         )
 
     async def async_update_data(self):
+        if self._coordinator.hass.is_stopping:
+            return self._coordinator.data
         try:
             if not self._apis:
                 try:
                     self._apis = await self.load_ubus()
+                # startup login failure is non-fatal; coordinator continues with empty APIs and retries on next poll
                 except Exception as err:
                     _LOGGER.error("Failed to load ubus APIs for device [%s]: %s", self._id, err)
                     self._apis = {}
 
-            info, (wireless, mesh), mwan3, wan, hosts, system_info = await asyncio.gather(
-                self.update_info(),
+            system_info = await self.update_system_info()
+            current_uptime = system_info.get("uptime", 0) if system_info else 0
+
+            need_board_refresh = (
+                self._cached_board_info is None
+                or (current_uptime > 0 and current_uptime < self._last_uptime)
+            )
+
+            if need_board_refresh:
+                fetched = await self.update_info()
+                if fetched:
+                    self._cached_board_info = fetched
+
+            if current_uptime > 0:
+                self._last_uptime = current_uptime
+
+            info = self._cached_board_info or {}
+
+            (wireless, mesh), mwan3, wan, hosts, modem = await asyncio.gather(
                 self._update_wireless(),
                 self.discover_mwan3(),
                 self.update_wan_info(),
                 self.fetch_host_hints(),
-                self.update_system_info(),
+                self.update_modem_stats(),
             )
 
             result = dict(
@@ -522,18 +591,21 @@ class DeviceCoordinator:
                 wan=wan,
                 hosts=hosts,
                 system_info=system_info,
+                modem=modem,
             )
             _LOGGER.debug("Full update [%s]: %s", self._id, result)
             return result
         except PermissionError as err:
             raise ConfigEntryAuthFailed from err
+        except (TimeoutError, asyncio.CancelledError) as err:
+            raise UpdateFailed(f"OpenWrt communication error: {err}")
         except Exception as err:
             _LOGGER.exception("Device [%s] async_update_data error: %s", self._id, err)
             raise UpdateFailed(f"OpenWrt communication error: {err}")
 
 
 def new_ubus_client(hass, config: dict) -> Ubus:
-    _LOGGER.debug("new_ubus_client(): %s", config)
+    _LOGGER.debug("new_ubus_client(): %s", {k: v for k, v in config.items() if k != "password"})
     schema = "https" if config["https"] else "http"
     port = ":%d" % config["port"] if config["port"] > 0 else ""
     url = "%s://%s%s%s" % (schema, config["address"], port, config["path"])
@@ -546,7 +618,7 @@ def new_ubus_client(hass, config: dict) -> Ubus:
     )
 
 
-def new_coordinator(hass, config: dict, all_devices: dict) -> DeviceCoordinator:
-    _LOGGER.debug("new_coordinator: %s", config)
+def new_coordinator(hass, config: dict) -> DeviceCoordinator:
+    _LOGGER.debug("new_coordinator: %s", {k: v for k, v in config.items() if k != "password"})
     connection = new_ubus_client(hass, config)
-    return DeviceCoordinator(hass, config, connection, all_devices)
+    return DeviceCoordinator(hass, config, connection)

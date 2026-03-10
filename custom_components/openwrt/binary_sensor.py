@@ -22,6 +22,9 @@ async def async_setup_entry(
     for net_id in device.coordinator.data["mwan3"]:
         entities.append(Mwan3OnlineBinarySensor(device, device_id, net_id))
 
+    if device.coordinator.data.get("modem"):
+        entities.append(ModemRegisteredBinarySensor(device, device_id))
+
     async_add_entities(entities)
     return True
 
@@ -70,3 +73,38 @@ class Mwan3OnlineBinarySensor(OpenWrtEntity, BinarySensorEntity):
     @property
     def icon(self):
         return "mdi:access-point-network" if self.is_on else "mdi:access-point-network-off"
+
+
+class ModemRegisteredBinarySensor(OpenWrtEntity, BinarySensorEntity):
+    """Whether the modem is registered on the mobile network."""
+
+    def __init__(self, device, device_id: str):
+        super().__init__(device, device_id)
+
+    @property
+    def _modem(self) -> dict:
+        return self.data.get("modem", {})
+
+    @property
+    def available(self):
+        return bool(self._modem)
+
+    @property
+    def unique_id(self):
+        return f"{super().unique_id}.modem_registered"
+
+    @property
+    def name(self):
+        return f"{super().name} Modem registered"
+
+    @property
+    def is_on(self):
+        return bool(self._modem.get("registered", False))
+
+    @property
+    def device_class(self):
+        return "connectivity"
+
+    @property
+    def icon(self):
+        return "mdi:signal-cellular-3" if self.is_on else "mdi:signal-cellular-off"
