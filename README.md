@@ -4,29 +4,38 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-custom-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
 
-
 ## Features
 
 * Sensors:
   * Wireless clients counters (per interface/SSID) with client details (signal, IP, name)
   * Wireless total clients (aggregate across interfaces)
   * Known hosts sensor (lists IP, name and MAC)
-   * Number of connected mesh peers
-   * Signal strength of mesh links
+  * Number of connected mesh peers
+  * Signal strength of mesh links
   * `mwan3` interface online ratio (validated to avoid invalid data)
   * WAN interfaces Rx & Tx bytes counters (if configured)
-  * System sensors: uptime, load and memory (swap/disk usage when available)
+  * System sensors: uptime, load, memory, and disk usage (swap/root/tmp when available)
+  * 5G modem sensors (requires [modem stats sidecar](#modem-stats-sidecar)):
+    * Connection mode (LTE / 5G NSA / 5G SA) with operator, band, and cell attributes
+    * Signal metrics: LTE RSRP, RSRQ, RSSI, SINR and NR RSRP, RSRQ, SINR
+    * Modem temperature
+    * Traffic counters: RX/TX bytes and packets
+    * Last update timestamp
 * Switches:
   * Control WPS status
 * Binary sensors:
   * `mwan3` connectivity status
+  * Modem network registration status (requires [modem stats sidecar](#modem-stats-sidecar))
 * Services:
   * Reboot device: `openwrt.reboot`
   * Execute arbitrary command: `openwrt.exec` (see the configuration below)
   * Manage services using command-line: `openwrt.init` (see the configuration below)
+* Reconfigure: update credentials, polling interval, and other settings at runtime via the integration's **Reconfigure** option — no need to remove and re-add the device
 
-### Installing
+## Installing
+
 ### Automatic setup
+
 You can use the 'auto-setup.sh' script to automate the following router configuration steps.
 The script must be copied to and executed directly on the router (e.g. via SSH); it must not be run from your local machine or from within the repository.
 The script will check for required packages, create the ACL file, add the hass user, and configure rpcd.
@@ -82,8 +91,6 @@ Alternatively, you can follow the manual steps below:
         }
     }
 }
-
-
 ```
 
 * Add new system user `hass` (or do it in any other way that you prefer):
@@ -92,7 +99,7 @@ Alternatively, you can follow the manual steps below:
   * Change password: `passwd hass`
 * Edit `/etc/config/rpcd` and add:
 
-```
+```text
 config login
         option username 'hass'
         option password '$p$hass'
@@ -145,6 +152,31 @@ In order to allow ubus/rpcd execute a command remotely, the command should be ad
 }
 ```
 
+## Modem stats sidecar
+
+An optional OpenWrt-side service that reads AT command data from a 5G modem (tested with Quectel RG502Q-EA) every 60 seconds and writes it to `/tmp/modem-stats.json`. The HA integration reads this file to populate the modem sensors.
+
+### Installation
+
+Copy and run the install script directly on the router:
+
+```bash
+scp -r openwrt-modem-stats root@ROUTER_IP:/root/
+ssh root@ROUTER_IP
+cd /root/openwrt-modem-stats
+chmod +x install-modem-stats.sh
+./install-modem-stats.sh
+```
+
+The script will:
+* Copy the collector script and init file to the router
+* Update `/usr/share/rpcd/acl.d/hass.json` with file-read permissions for `/tmp/modem-stats.json`
+* Register the files in `/etc/sysupgrade.conf` for persistence across firmware updates
+* Enable and start the `modem-stats` service
+
+### Notes
+
+* The collector uses `sms_tool` on `/dev/ttyUSB2` — edit `modem-stats/collect` if your modem is on a different device path
+* Modem data is only available while the service is running; stopping it removes the JSON file so HA sensors become unavailable cleanly
+
 ### Screenshots
-
-
