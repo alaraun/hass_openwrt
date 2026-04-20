@@ -6,7 +6,13 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.util.json import json_loads
 
-from .ubus import Ubus
+from .ubus import (
+    Ubus,
+    UbusConnectionError,
+    UbusObjectNotFoundError,
+    UbusPermissionError,
+    UbusRPCError,
+)
 from .constants import DOMAIN
 
 import logging
@@ -133,6 +139,8 @@ class DeviceCoordinator:
                     result["mesh"].append(conf)
 
         # optional subsystem — uci.get may not be present; catch all to keep wireless discovery alive
+        except UbusConnectionError:
+            raise
         except Exception as err:
             _LOGGER.warning(
                 "Device [%s] doesn't support wireless (uci get) or parse failed: %s",
@@ -182,7 +190,7 @@ class DeviceCoordinator:
                         else:
                             _LOGGER.debug("mesh_id not found for %s", iface["ifname"])
                         result["mesh"].append(conf)
-        except NameError as err:
+        except UbusObjectNotFoundError as err:
             _LOGGER.warning("Device [%s] doesn't support wireless: %s", self._id, err)
         return result
 
@@ -246,8 +254,10 @@ class DeviceCoordinator:
                         signal=assoc.get("signal", -100),
                         noise=assoc.get("noise", 0),
                     )
-        except ConnectionError as err:
-            _LOGGER.warning("Device [%s] doesn't support iwinfo: %s", self._id, err)
+        except UbusConnectionError:
+            raise
+        except Exception as err:
+            _LOGGER.warning("Device [%s] doesn't support iwinfo or parse failed: %s", self._id, err)
         return result
 
     async def update_hostapd_clients(self, interface_id: str) -> dict:
@@ -275,17 +285,21 @@ class DeviceCoordinator:
                         f"hostapd.{interface_id}", "wps_status", {}
                     )
                     result["wps"] = wps_response.get("pbc_status") == "Active"
-                except ConnectionError as err:
+                except UbusConnectionError:
+                    raise
+                except Exception as err:
                     _LOGGER.warning(
-                        "Interface [%s] doesn't support WPS: %s", interface_id, err
+                        "Interface [%s] doesn't support WPS or parse failed: %s", interface_id, err
                     )
 
             return result
 
-        except NameError as e:
+        except (UbusConnectionError, TimeoutError):
+            raise
+        except UbusObjectNotFoundError as e:
             _LOGGER.warning("Could not find object for interface %s: %s", interface_id, e)
             return {}
-        except (ConnectionError, KeyError, ValueError, TimeoutError) as e:
+        except (KeyError, ValueError) as e:
             _LOGGER.error("Error updating hostapd clients for %s: %s", interface_id, e)
             return {}
 
@@ -367,7 +381,9 @@ class DeviceCoordinator:
                 clients_info = await self.update_hostapd_clients(ifname)
                 clients_info["ssid"] = item.get("ssid", ifname)
                 result[ifname] = clients_info
-            except (ConnectionError, KeyError, ValueError) as e:
+            except UbusConnectionError:
+                raise
+            except (KeyError, ValueError) as e:
                 _LOGGER.error("Error updating AP for %s: %s", ifname, e)
         return result
 
@@ -440,6 +456,8 @@ class DeviceCoordinator:
                 }
             return hosts
         # optional subsystem — luci-rpc may not be installed; swallow all errors to keep the poll alive
+        except UbusConnectionError:
+            raise
         except Exception as err:
             _LOGGER.warning("Failed to get host hints for device [%s]: %s", self._id, err)
             return {}
@@ -452,7 +470,7 @@ class DeviceCoordinator:
             response = await self._ubus.api_call(
                 "file", "read", {"path": "/tmp/modem-stats.json"}
             )
-        except ConnectionError as err:
+        except UbusRPCError as err:
             _LOGGER.debug(
                 "Modem stats file not available on device [%s]: %s", self._id, err
             )
@@ -484,6 +502,8 @@ class DeviceCoordinator:
                 "swap": response.get("swap", {}),
             }
         # semi-optional — system.info failure is non-fatal; uptime falls back to 0 (no reboot assumed)
+        except UbusConnectionError:
+            raise
         except Exception as err:
             _LOGGER.warning("Device [%s] failed to get system info: %s", self._id, err)
             return {}
@@ -497,6 +517,8 @@ class DeviceCoordinator:
             try:
                 await self._ubus.login()
             # login can raise ubus auth errors, network errors, or unexpected server responses; all are non-fatal here
+            except (UbusConnectionError, ConfigEntryAuthFailed):
+                raise
             except Exception as err:
                 _LOGGER.error("Failed to login and load ACLs: %s", err)
                 return {}
@@ -522,6 +544,8 @@ class DeviceCoordinator:
             try:
                 return await self.discover_wireless()
             # triggers permanent UCI fallback; must catch ubus RPC errors and OpenWrt 25.12 rpcd protocol errors
+            except (UbusConnectionError, ConfigEntryAuthFailed):
+                raise
             except Exception as err:
                 _LOGGER.warning(
                     "discover_wireless failed, switching permanently to UCI fallback "
@@ -533,6 +557,8 @@ class DeviceCoordinator:
         try:
             return await self.discover_wireless_uci()
         # last-resort fallback — catch all discovery errors; returning empty config is safer than crashing the poll
+        except UbusConnectionError:
+            raise
         except Exception as err:
             _LOGGER.warning("discover_wireless_uci failed: %s", err)
         return dict(ap=[], mesh=[])
@@ -553,6 +579,8 @@ class DeviceCoordinator:
                 try:
                     self._apis = await self.load_ubus()
                 # startup login failure is non-fatal; coordinator continues with empty APIs and retries on next poll
+                except (UbusConnectionError, ConfigEntryAuthFailed):
+                    raise
                 except Exception as err:
                     _LOGGER.error("Failed to load ubus APIs for device [%s]: %s", self._id, err)
                     self._apis = {}
@@ -595,8 +623,11 @@ class DeviceCoordinator:
             )
             _LOGGER.debug("Full update [%s]: %s", self._id, result)
             return result
-        except PermissionError as err:
+        except UbusPermissionError as err:
             raise ConfigEntryAuthFailed from err
+        except UbusConnectionError as err:
+            _LOGGER.warning("Device [%s] communication error: %s", self._id, err)
+            raise UpdateFailed(f"OpenWrt communication error: {err}") from err
         except (TimeoutError, asyncio.CancelledError) as err:
             raise UpdateFailed(f"OpenWrt communication error: {err}")
         except Exception as err:
