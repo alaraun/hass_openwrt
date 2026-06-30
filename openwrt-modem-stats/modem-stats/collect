@@ -105,15 +105,33 @@ SCC_LTE=$(echo "$O_RF" \
 [ -n "$NR_BAND" ] && BANDS="${BANDS}+${NR_BAND}"
 
 # ── Protocol detection ────────────────────────────────────────────────────────
+# Detect from the driver actually bound to the modem netdev. The base RawIP/QMAP
+# device is wwan0 (qmi_wwan_q); fall back to other usbnet devices if absent.
+# (The old /sys/kernel/debug/usb/devices parse never saw Driver= — those bindings
+# live on the I: interface lines, not the P: line the awk delimiter landed on.)
 PROTO="mbim"
-PVCUT=$(awk -F'Vendor=2c7c ProdID=0800' '{print $2}' /sys/kernel/debug/usb/devices 2>/dev/null)
-echo "$PVCUT" | grep -q "Driver=qmi_wwan" && PROTO="qmi"
-echo "$PVCUT" | grep -q "Driver=cdc_ether" && PROTO="ecm"
+for d in wwan0 wwan1 usb0; do
+    [ -e "/sys/class/net/$d/device/driver" ] || continue
+    DRV=$(basename "$(readlink "/sys/class/net/$d/device/driver" 2>/dev/null)" 2>/dev/null)
+    break
+done
+case "$DRV" in
+    qmi_wwan*) PROTO="qmi"  ;;
+    cdc_mbim)  PROTO="mbim" ;;
+    cdc_ether) PROTO="ecm"  ;;
+    cdc_ncm)   PROTO="ncm"  ;;
+esac
 
 # ── Interface RX/TX stats ─────────────────────────────────────────────────────
 # Primary: ask OpenWrt's network daemon for the L3 device name (works for any proto)
-IFACE=$(ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@.l3_device')
-# Fallback: first wwan*/usb* netdev visible in sysfs (covers down/restarting iface)
+IFACE=""
+for net in wwan_q wwan_q_4 wwan; do
+    s=$(ubus call network.interface."$net" status 2>/dev/null) || continue
+    [ -n "$s" ] || continue
+    IFACE=$(printf '%s' "$s" | jsonfilter -e '@.l3_device' 2>/dev/null)
+    [ -n "$IFACE" ] && break
+done
+[ -z "$IFACE" ] && IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -E '^wwan0_[0-9]+$' | head -1)
 [ -z "$IFACE" ] && IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -E '^(wwan|usb)[0-9]' | head -1)
 
 STATS_DIR="/sys/class/net/${IFACE}/statistics"
