@@ -164,19 +164,33 @@ def auto_enable_custom_integrations(enable_custom_integrations):
 
 
 @pytest.fixture
-async def router(socket_enabled, aiohttp_server):
-    fake = FakeRouter()
-    app = web.Application()
-    app.router.add_post("/ubus", fake.handle)
-    server = await aiohttp_server(app)
-    fake.port = server.port
-    yield fake
-    fake.release()
+async def router_factory(socket_enabled, aiohttp_server):
+    """Start fake routers; each has its own port."""
+    fakes: list[FakeRouter] = []
+
+    async def _start() -> FakeRouter:
+        fake = FakeRouter()
+        app = web.Application()
+        app.router.add_post("/ubus", fake.handle)
+        server = await aiohttp_server(app)
+        fake.port = server.port
+        fakes.append(fake)
+        return fake
+
+    yield _start
+    for fake in fakes:
+        fake.release()
+
+
+@pytest.fixture
+async def router(router_factory) -> FakeRouter:
+    return await router_factory()
 
 
 @pytest.fixture
 def make_entry(router: FakeRouter) -> Callable[..., MockConfigEntry]:
-    def _make(**overrides) -> MockConfigEntry:
+    def _make(fake: FakeRouter | None = None, unique_id: str | None = None, **overrides) -> MockConfigEntry:
+        fake = fake or router
         data = {
             "id": "test-ap",
             "address": "127.0.0.1",
@@ -184,14 +198,14 @@ def make_entry(router: FakeRouter) -> Callable[..., MockConfigEntry]:
             "password": PASSWORD,
             "https": False,
             "verify_cert": False,
-            "port": router.port,
+            "port": fake.port,
             "path": "/ubus",
             "interval": 30,
             "wps": False,
             **overrides,
         }
         return MockConfigEntry(
-            domain=DOMAIN, data=data, unique_id=data["address"],
+            domain=DOMAIN, data=data, unique_id=unique_id or data["address"],
             title=f"{data['id']} - {data['address']}",
         )
 

@@ -7,7 +7,8 @@
 ## Features
 
 * Sensors:
-  * Wireless clients counters (per interface/SSID) with client details (signal, IP, name)
+  * Wireless clients counters (per interface/SSID)
+  * Per-client Wi-Fi signal (disabled by default, see [Wi-Fi clients](#wi-fi-clients))
   * Wireless total clients (aggregate across interfaces)
   * Known hosts sensor (lists IP, name and MAC)
   * Number of connected mesh peers
@@ -21,6 +22,7 @@
     * Modem temperature
     * Traffic counters: RX/TX bytes and packets
     * Last update timestamp
+* Device trackers: one per Wi-Fi client across all routers (see [Wi-Fi clients](#wi-fi-clients))
 * Switches:
   * Control WPS status
 * Binary sensors:
@@ -34,17 +36,39 @@
 * Re-authentication: when the router rejects the saved password, Home Assistant asks for new credentials
 * Diagnostics: **Download diagnostics** on the device page (password, username, IMEI and ICCID redacted)
 
+### Wi-Fi clients
+
+Every client that associates to an access point of any configured router gets one
+`device_tracker` entity: `home` while it is connected to any of the routers, `not_home`
+otherwise. Its attributes are the IP address and host name (from the routers' host hints),
+the MAC address, and the `router` and `ssid` it is on. Moving between routers changes only
+these two attributes. Routers are polled at different times; when a client leaves the router
+it was on, the other routers are polled at once, and the tracker shows `not_home` only if none
+of them has it.
+
+Trackers are created disabled: enable the ones you want under **Settings → Entities**
+(filter on the integration, show disabled entities). They have no device of their own, so the
+device list holds only the routers. A tracker is owned by the router entry that saw the client
+first.
+
+Each client also gets a `<name> Wi-Fi signal` sensor (dBm, at the access point it is on). It is
+disabled by default: an enabled one records a value on most polls.
+
+While Home Assistant starts, the trackers stay unavailable until every router has been read.
+A router whose poll fails keeps its last client list.
+
 ### Recorder
 
 Attributes that change on most polls are shown live but not written to the recorder database:
-the per-client details of the wireless clients sensors, the mesh peers, the known hosts list,
-the per-SSID totals, and the memory, load and disk details. The sensor states themselves are
+the mesh peers, the known hosts list, the per-SSID totals, and the memory, load and disk
+details. The wireless clients sensors carry only their SSID; per-client details are the
+trackers and signal sensors above. The sensor states themselves are
 recorded as before. The modem mode sensor no longer carries the collection time
 (`last_update`); it is the state of the `Modem last update` sensor.
 
 ### Availability
 
-A poll that fails (the router does not answer within 15 s, or the connection drops) marks the
+A poll that fails (no connection within 10 s, no answer within 30 s, or the connection drops) marks the
 device's entities unavailable until the next successful poll; Home Assistant logs the failure
 once, naming the device and the call, and logs the recovery. While Home Assistant starts, the
 integration reads each device once and then waits for the start to finish before polling.

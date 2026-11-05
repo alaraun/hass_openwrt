@@ -6,8 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **Wi-Fi client trackers**: one `device_tracker` per client across all routers, with `router` and `ssid` attributes. Created disabled and without a device of their own. A client that leaves a router is shown `not_home` only after the other routers have been polled once more, so roaming does not flap.
+- **Per-client Wi-Fi signal sensors**, disabled by default.
+
 ### Changed
 
+- The wireless clients sensors no longer list each client as an attribute (the trackers and signal sensors do); they now change only with the client count.
+- Call time limits: 10 s to connect, 30 s for the answer (was 15 s for both).
 - **System uptime** is a timestamp sensor holding the boot time; its state changes only on a reboot (it was a text such as `14d 23h 32m` with a `seconds` attribute, rewritten on every poll).
 - Attributes that change on most polls (per-client details, mesh peers, known hosts, per-SSID totals, memory, load and disk details) are no longer recorded; they stay visible live.
 - The modem mode sensor drops the `last_update` attribute (use the `Modem last update` sensor).

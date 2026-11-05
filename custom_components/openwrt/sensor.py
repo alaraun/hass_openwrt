@@ -14,9 +14,19 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from . import OpenWrtConfigEntry
+from .clients import (
+    UNIQUE_ID_PREFIX,
+    ClientEntity,
+    async_setup_client_entities,
+    connected_clients,
+)
 from .entity import OpenWrtEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+def signal_unique_id(mac: str) -> str:
+    return f"{UNIQUE_ID_PREFIX}{mac}.signal"
+
 
 # A boot time computed from a later poll may differ by the poll's latency and the
 # whole-second uptime; a reboot is recognised by the uptime going down.
@@ -102,6 +112,10 @@ async def async_setup_entry(
 
     async_add_entities(entities)
 
+    async_setup_client_entities(
+        hass, entry, "sensor", signal_unique_id, ClientSignalSensor, async_add_entities
+    )
+
     # Wireless and mesh interfaces that appear later get their sensors on the next
     # poll; vanished ones turn their sensors unavailable (see `available`).
     known_wireless: set[str] = set(data["wireless"])
@@ -137,8 +151,6 @@ class WirelessClientsSensor(OpenWrtSensor):
     """Number of clients on a wireless interface."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    # per-client signal, IP and name: live only, they change on most polls
-    _unrecorded_attributes = frozenset({MATCH_ALL})
 
     def __init__(self, device, device_id: str, interface: str) -> None:
         super().__init__(device, device_id)
@@ -171,20 +183,10 @@ class WirelessClientsSensor(OpenWrtSensor):
 
     @property
     def extra_state_attributes(self):
-        result = dict()
-        data = self._iface
-        hosts = {mac.lower(): info for mac, info in self.data.get("hosts", {}).items()}
-        for mac, value in data.get("macs", {}).items():
-            host = hosts.get(mac.lower(), {})
-            client_info = f"{value.get('signal', 0)} dBm"
-            if host.get("ip"):
-                client_info += f" | IP: {host['ip']}"
-            if host.get("name"):
-                client_info += f" | Name: {host['name']}"
-            result[mac.upper()] = client_info
-        if "ssid" in data:
-            result["ssid"] = data["ssid"]
-        return result
+        # Per-client details are the client trackers and signal sensors.
+        if "ssid" in self._iface:
+            return {"ssid": self._iface["ssid"]}
+        return {}
 
 
 class MeshSignalSensor(OpenWrtSensor):
@@ -678,3 +680,33 @@ class ModemTimestampSensor(_ModemSensor):
             return datetime.fromtimestamp(int(ts), tz=UTC)
         except (TypeError, ValueError, OverflowError, OSError):
             return None
+
+
+class ClientSignalSensor(ClientEntity, SensorEntity):
+    """Signal of one Wi-Fi client at the access point it is on (disabled by default)."""
+
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = "dBm"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:wifi"
+
+    def __init__(self, hass: HomeAssistant, mac: str) -> None:
+        super().__init__(hass, mac)
+        self._attr_unique_id = signal_unique_id(mac)
+        self._attr_name = f"{self._host_name or mac} Wi-Fi signal"
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._seen is not None and self._seen.signal is not None
+
+    @property
+    def native_value(self) -> int | None:
+        return self._seen.signal if self._seen else None
+
+    @callback
+    def _async_refresh(self) -> bool:
+        old = self._seen
+        self._seen = connected_clients(self.hass).get(self._mac)
+        return self._seen != old

@@ -5,9 +5,12 @@ import logging
 import homeassistant.helpers.config_validation as cv
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import service
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.typing import ConfigType
 
+from .clients import SIGNAL_CLIENTS_UPDATED, release_claims
 from .constants import DOMAIN, PLATFORMS
 from .coordinator import DeviceCoordinator, new_coordinator
 
@@ -23,11 +26,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenWrtConfigEntry) -> b
     await device.async_config_entry_first_refresh()
     entry.runtime_data = device
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # client trackers and signal sensors merge the client lists of every router
+    entry.async_on_unload(
+        device.async_add_listener(lambda: async_dispatcher_send(hass, SIGNAL_CLIENTS_UPDATED))
+    )
+    async_dispatcher_send(hass, SIGNAL_CLIENTS_UPDATED)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: OpenWrtConfigEntry) -> bool:
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        release_claims(hass, entry)
+    return unloaded
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: OpenWrtConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Allow deleting any device of the entry except the router itself."""
+    return not any(identifier[0] == "id" for identifier in device.identifiers)
 
 
 def _devices(hass: HomeAssistant, entry_ids) -> dict[str, DeviceCoordinator]:

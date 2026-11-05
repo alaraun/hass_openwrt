@@ -7,7 +7,7 @@ import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util.json import json_loads
@@ -53,6 +53,8 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._wireless_via_uci = False
         self._cached_board_info: dict | None = None
         self._last_uptime: int = 0
+        # completed polls, failed ones too (client trackers wait for one)
+        self.poll_count = 0
 
     @property
     def device_id(self) -> str:
@@ -556,6 +558,11 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.update_ap(wireless_config["ap"]),
             self.update_mesh(wireless_config["mesh"]),
         )
+
+    @callback
+    def async_update_listeners(self) -> None:
+        self.poll_count += 1
+        super().async_update_listeners()
 
     async def _async_update_data(self) -> dict[str, Any]:
         if self.data is not None and self.hass.state is not CoreState.running:

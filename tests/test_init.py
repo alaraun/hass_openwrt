@@ -61,11 +61,20 @@ async def test_setup_creates_entities_with_stable_ids(hass, router, make_entry):
 
 async def test_volatile_attributes_are_not_recorded(hass, router, make_entry):
     await _setup(hass, make_entry())
-    for entity_id in (CLIENTS, MEMORY, HOSTS, "sensor.openwrt_test_ap_system_load"):
+    for entity_id in (MEMORY, HOSTS, "sensor.openwrt_test_ap_system_load"):
         state = hass.states.get(entity_id)
         assert MATCH_ALL in state.state_info["unrecorded_attributes"], entity_id
-    attrs = hass.states.get(CLIENTS).attributes
-    assert attrs["02:00:00:00:00:01".upper()] == "-50 dBm | IP: 192.0.2.10 | Name: laptop"
+
+
+async def test_clients_sensor_carries_no_per_client_attributes(hass, router, make_entry, freezer):
+    """Per-client details are trackers and signal sensors; a signal change writes nothing."""
+    await _setup(hass, make_entry())
+    before = hass.states.get(CLIENTS)
+    assert before.attributes["ssid"] == "TestNet"
+    assert not [k for k in before.attributes if k.count(":") == 5]
+    router.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {"02:00:00:00:00:01": {"signal": -71}}}
+    await _poll(hass, freezer)
+    assert hass.states.get(CLIENTS).last_updated == before.last_updated
 
 
 async def test_modem_mode_has_no_collection_time_attribute(hass, router, make_entry):
