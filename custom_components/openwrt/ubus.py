@@ -13,7 +13,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT: float = 15
+# Failure bounds: a reply normally takes well under a second; Home Assistant's own
+# start can delay one by about 15 s on a busy host. A router that is off fails the
+# connect bound.
+DEFAULT_TIMEOUT: float = 30
+CONNECT_TIMEOUT: float = 10
 ANONYMOUS_SESSION = "00000000000000000000000000000000"
 
 
@@ -56,6 +60,7 @@ class Ubus:
         self.username = username
         self.password = password
         self.timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+        self.connect_timeout = min(CONNECT_TIMEOUT, self.timeout)
         self.verify = verify
         self.session_id = ""
         self._rpc_counter = itertools.count(1)
@@ -149,7 +154,9 @@ class Ubus:
         call = f"{subsystem}.{method}" if method else subsystem
 
         try:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            timeout = aiohttp.ClientTimeout(
+                total=self.timeout, sock_connect=self.connect_timeout
+            )
             async with self._session.post(
                 self.url, json=payload, timeout=timeout
             ) as response:
@@ -159,6 +166,10 @@ class Ubus:
                     )
                 # content_type=None: rpcd may omit application/json
                 json_response = await response.json(content_type=None)
+        except aiohttp.ConnectionTimeoutError as err:
+            raise UbusConnectionError(
+                f"{call}: no connection to {self.url} within {self.connect_timeout:g} s"
+            ) from err
         except TimeoutError as err:
             # aiohttp's total timeout raises a bare TimeoutError (empty message)
             raise UbusConnectionError(

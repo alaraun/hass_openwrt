@@ -38,6 +38,27 @@ async def test_timeout_is_a_connection_error_with_a_message(hass, router):
         await ubus.api_call("system", "info", {})
 
 
+async def test_connect_timeout_is_named(hass, router, monkeypatch):
+    """A router that is off fails the connect bound, not the answer bound."""
+    import aiohttp
+
+    from custom_components.openwrt import ubus as ubus_module
+
+    seen = {}
+
+    class _Session:
+        def post(self, url, json=None, timeout=None):
+            seen["timeout"] = timeout
+            raise aiohttp.ConnectionTimeoutError("Connection timeout to host")
+
+    monkeypatch.setattr(ubus_module.Ubus, "_session", property(lambda self: _Session()))
+    ubus = _client(hass, router)
+    with pytest.raises(UbusConnectionError, match=r"session\.login: no connection to .* within 10 s"):
+        await ubus.login()
+    assert seen["timeout"].total == 30
+    assert seen["timeout"].sock_connect == 10
+
+
 async def test_malformed_reply_is_a_connection_error(hass, router):
     router.answers[("system", "info")] = b'{"jsonrpc": "2.0", "result": [0, {"upt'
     ubus = _client(hass, router)
