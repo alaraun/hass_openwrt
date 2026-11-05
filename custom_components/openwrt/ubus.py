@@ -1,12 +1,20 @@
+"""JSON-RPC client for the OpenWrt ubus HTTP endpoint (uhttpd-mod-ubus)."""
+
+from __future__ import annotations
+
 import asyncio
 import itertools
-import aiohttp
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import logging
+from typing import Any
+
+import aiohttp
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT: int = 15
+DEFAULT_TIMEOUT: float = 15
+ANONYMOUS_SESSION = "00000000000000000000000000000000"
 
 
 class UbusError(Exception):
@@ -14,44 +22,44 @@ class UbusError(Exception):
 
 
 class UbusConnectionError(UbusError):
-    """Error connecting to Ubus."""
+    """The endpoint did not answer, timed out, or sent a malformed reply."""
 
 
 class UbusAuthError(UbusError):
-    """Authentication error."""
-
-
-class UbusPermissionError(UbusError):
-    """Insufficient permissions."""
-
-
-class UbusObjectNotFoundError(UbusError):
-    """Ubus object or method not found."""
+    """The login was rejected."""
 
 
 class UbusRPCError(UbusError):
-    """Generic RPC error."""
+    """A call was answered with an error."""
+
+
+class UbusPermissionError(UbusRPCError):
+    """The session may not call this object or method (ACL)."""
+
+
+class UbusObjectNotFoundError(UbusRPCError):
+    """The ubus object or method does not exist."""
 
 
 class Ubus:
     def __init__(
         self,
-        hass,
+        hass: HomeAssistant,
         url: str,
         username: str,
         password: str,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         verify: bool = True,
-    ):
+    ) -> None:
         self._hass = hass
         self.url = url
         self.username = username
         self.password = password
-        self.timeout = timeout
+        self.timeout = DEFAULT_TIMEOUT if timeout is None else timeout
         self.verify = verify
         self.session_id = ""
         self._rpc_counter = itertools.count(1)
-        self.acls = {}
+        self.acls: dict[str, Any] = {}
         self._login_lock = asyncio.Lock()
 
     @property
@@ -65,6 +73,11 @@ class Ubus:
         params: dict,
         rpc_method: str = "call",
     ) -> dict:
+        """Call `subsystem.method`; log in first, and once more on a stale session.
+
+        A missing object or method returns `{}`. Raises UbusConnectionError,
+        UbusAuthError, or UbusRPCError (UbusPermissionError after a fresh login).
+        """
         _LOGGER.debug("api_call: %s.%s params=%s", subsystem, method, params)
         try:
             if self.session_id:
@@ -77,36 +90,38 @@ class Ubus:
             return {}
 
         try:
-            async with self._login_lock:
-                if not self.session_id:
-                    await self._login()
+            await self.login()
             return await self._api_call(rpc_method, subsystem, method, params)
         except UbusObjectNotFoundError as err:
             _LOGGER.debug("api_call: object not found after login, returning empty: %s", err)
             return {}
 
-    async def login(self):
-        """Acquire the login lock and perform login. Safe to call concurrently."""
+    async def login(self) -> None:
+        """Log in unless a session exists. Safe to call concurrently."""
         async with self._login_lock:
             if not self.session_id:
                 await self._login()
 
-    async def _login(self):
-        _LOGGER.debug("Logging in to Ubus...")
+    async def _login(self) -> None:
+        _LOGGER.debug("Logging in to %s as %s", self.url, self.username)
         try:
             result = await self._api_call(
                 "call",
                 "session",
                 "login",
                 dict(username=self.username, password=self.password),
-                "00000000000000000000000000000000",
+                ANONYMOUS_SESSION,
             )
-        except UbusRPCError as err:
+        except UbusPermissionError as err:
             raise UbusAuthError(f"Login failed: {err}") from err
-        _LOGGER.debug("Login successful")
+        except UbusRPCError as err:
+            # rpcd not ready (the session object is missing while the device boots)
+            raise UbusConnectionError(f"Login not answered: {err}") from err
+        if not isinstance(result, dict) or "ubus_rpc_session" not in result:
+            raise UbusConnectionError("Login not answered: no session in the reply")
         self.session_id = result["ubus_rpc_session"]
         self.acls = result.get("acls", {})
-        _LOGGER.debug("ACLs: %s", self.acls)
+        _LOGGER.debug("Login successful; ACLs: %s", self.acls)
 
     async def _api_call(
         self,
@@ -114,9 +129,9 @@ class Ubus:
         subsystem: str,
         method: str,
         params: dict,
-        session: str = None,
-    ) -> dict:
-        _params = [session if session else self.session_id, subsystem]
+        session: str | None = None,
+    ) -> Any:
+        _params: list[Any] = [session if session else self.session_id, subsystem]
         if method:
             _params.append(method)
         _params.append(params if params else {})
@@ -127,7 +142,11 @@ class Ubus:
             "method": rpc_method,
             "params": _params,
         }
-        _LOGGER.debug("API call payload: %s", payload)
+        # The session id and login parameters stay out of the log.
+        _LOGGER.debug(
+            "API call #%s: %s %s.%s", payload["id"], rpc_method, subsystem, method
+        )
+        call = f"{subsystem}.{method}" if method else subsystem
 
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
@@ -135,37 +154,46 @@ class Ubus:
                 self.url, json=payload, timeout=timeout
             ) as response:
                 if response.status != 200:
-                    _LOGGER.error("api_call http error: %s", response.status)
-                    raise UbusConnectionError(f"HTTP error {response.status} from {self.url}")
-                # content_type=None avoids strict checking; rpcd may omit application/json
+                    raise UbusConnectionError(
+                        f"{call}: HTTP {response.status} from {self.url}"
+                    )
+                # content_type=None: rpcd may omit application/json
                 json_response = await response.json(content_type=None)
+        except TimeoutError as err:
+            # aiohttp's total timeout raises a bare TimeoutError (empty message)
+            raise UbusConnectionError(
+                f"{call}: no answer within {self.timeout:g} s"
+            ) from err
         except (aiohttp.ClientError, RuntimeError) as err:
-            _LOGGER.debug("api_call exception: %s", err)
-            raise UbusConnectionError(f"Communication error: {err}") from err
+            raise UbusConnectionError(f"{call}: {type(err).__name__}: {err}") from err
+        except ValueError as err:
+            raise UbusConnectionError(f"{call}: malformed reply: {err}") from err
 
-        _LOGGER.debug("Raw JSON response: %s", json_response)
+        if not isinstance(json_response, dict):
+            raise UbusConnectionError(f"{call}: malformed reply")
 
         if "error" in json_response:
             code = json_response["error"].get("code")
             message = json_response["error"].get("message")
             if code == -32000:
-                # Object not found — expected for optional ubus objects (mwan3, etc.)
-                _LOGGER.debug("api_call: ubus object not found: %s", message)
-                raise UbusObjectNotFoundError(message)
+                # Object not found: expected for optional objects (mwan3, luci-rpc)
+                _LOGGER.debug("%s: ubus object not found: %s", call, message)
+                raise UbusObjectNotFoundError(f"{call}: {message}")
             if code == -32002:
-                _LOGGER.debug("api_call RPC error: %s", json_response["error"])
-                raise UbusPermissionError(message)
-            _LOGGER.error("api_call RPC error: %s", json_response["error"])
-            raise UbusRPCError(f"RPC error: {message}")
+                _LOGGER.debug("%s: access denied: %s", call, message)
+                raise UbusPermissionError(f"{call}: {message}")
+            raise UbusRPCError(f"{call}: RPC error {code}: {message}")
 
-        result = json_response["result"]
+        result = json_response.get("result")
         if rpc_method == "list":
             return result
+        if not isinstance(result, list) or not result:
+            raise UbusConnectionError(f"{call}: malformed reply")
         result_code = result[0]
-        if result_code == 8:
-            raise UbusPermissionError("RPC error: not allowed")
-        if result_code == 6:
-            raise UbusPermissionError("RPC error: insufficient permissions")
         if result_code == 0:
-            return json_response["result"][1] if len(result) > 1 else {}
-        raise UbusRPCError(f"RPC error code: {result[0]}")
+            _LOGGER.debug("API call #%s answered", payload["id"])
+            return result[1] if len(result) > 1 else {}
+        if result_code in (6, 8):
+            # 6 UBUS_STATUS_PERMISSION_DENIED, 8 UBUS_STATUS_NOT_SUPPORTED
+            raise UbusPermissionError(f"{call}: not allowed (ubus status {result_code})")
+        raise UbusRPCError(f"{call}: ubus status {result_code}")
