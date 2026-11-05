@@ -14,7 +14,7 @@
   * Signal strength of mesh links
   * `mwan3` interface online ratio (validated to avoid invalid data)
   * WAN interfaces Rx & Tx bytes counters (if configured)
-  * System sensors: uptime, load, memory, and disk usage (swap/root/tmp when available)
+  * System sensors: boot time (`System uptime`, a timestamp that changes only on a reboot), load, memory, and disk usage (swap/root/tmp when available)
   * 5G modem sensors (requires [modem stats sidecar](#modem-stats-sidecar)):
     * Connection mode (LTE / 5G NSA / 5G SA) with operator, band, and cell attributes
     * Signal metrics: LTE RSRP, RSRQ, RSSI, SINR and NR RSRP, RSRQ, SINR
@@ -31,6 +31,22 @@
   * Execute arbitrary command: `openwrt.exec` (see the configuration below)
   * Manage services using command-line: `openwrt.init` (see the configuration below)
 * Reconfigure: update credentials, polling interval, and other settings at runtime via the integration's **Reconfigure** option — no need to remove and re-add the device
+* Re-authentication: when the router rejects the saved password, Home Assistant asks for new credentials
+* Diagnostics: **Download diagnostics** on the device page (password, username, IMEI and ICCID redacted)
+
+### Recorder
+
+Attributes that change on most polls are shown live but not written to the recorder database:
+the per-client details of the wireless clients sensors, the mesh peers, the known hosts list,
+the per-SSID totals, and the memory, load and disk details. The sensor states themselves are
+recorded as before. The modem mode sensor no longer carries the collection time
+(`last_update`); it is the state of the `Modem last update` sensor.
+
+### Availability
+
+A poll that fails (the router does not answer within 15 s, or the connection drops) marks the
+device's entities unavailable until the next successful poll; Home Assistant logs the failure
+once, naming the device and the call, and logs the recovery.
 
 ## Installing
 

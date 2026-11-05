@@ -19,7 +19,41 @@
           "wifi_devices": "Wi-Fi device names (comma-separated)",
           "mesh_devices": "Mesh device names (comma-separated)"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure OpenWrt device",
+        "description": "Settings of {address}. Saving reloads the device.",
+        "data": {
+          "username": "Username with access to the Ubus",
+          "password": "Password",
+          "https": "Use HTTPS",
+          "verify_cert": "Verify HTTPS certificate",
+          "port": "Custom port ('0' to use the default one)",
+          "path": "Ubus endpoint URI path",
+          "interval": "Data fetch interval in seconds",
+          "wps": "WPS support",
+          "wan_devices": "WAN device names (comma-separated)",
+          "wifi_devices": "Wi-Fi device names (comma-separated)",
+          "mesh_devices": "Mesh device names (comma-separated)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Sign in to OpenWrt device again",
+        "description": "{address} rejected the saved credentials.",
+        "data": {
+          "username": "Username with access to the Ubus",
+          "password": "Password"
+        }
       }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Check address, port, path and network.",
+      "invalid_auth": "The device rejected the username or password."
+    },
+    "abort": {
+      "already_configured": "This device is already configured.",
+      "reauth_successful": "Signed in again.",
+      "reconfigure_successful": "Settings saved."
     }
   },
   "services": {
@@ -91,4 +125,3 @@
     }
   }
 }
-  

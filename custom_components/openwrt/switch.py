@@ -1,64 +1,50 @@
-from homeassistant.config_entries import ConfigEntry
+from __future__ import annotations
+
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-import logging
-
-from . import OpenWrtEntity
-
-_LOGGER = logging.getLogger(__name__)
+from . import OpenWrtConfigEntry
+from .entity import OpenWrtEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities,
+    entry: OpenWrtConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     device = entry.runtime_data
     device_id = entry.data["id"]
 
-    entities = [
+    async_add_entities(
         WirelessWpsSwitch(device, device_id, net_id)
-        for net_id, info in device.coordinator.data["wireless"].items()
+        for net_id, info in device.data["wireless"].items()
         if "wps" in info
-    ]
-    async_add_entities(entities)
-    return True
+    )
 
 
 class WirelessWpsSwitch(OpenWrtEntity, SwitchEntity):
-    def __init__(self, device, device_id, interface: str):
+
+    _attr_icon = "mdi:security"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, device, device_id, interface: str) -> None:
         super().__init__(device, device_id)
         self._interface_id = interface
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.wps"
+        self._attr_name = f"Wireless [{interface}] WPS toggle"
 
     @property
     def available(self) -> bool:
-        return self._interface_id in self.data.get("wireless", {})
+        return super().available and self._interface_id in self.data.get("wireless", {})
 
     @property
-    def unique_id(self):
-        return "%s.%s.wps" % (super().unique_id, self._interface_id)
+    def is_on(self) -> bool:
+        return self.data.get("wireless", {}).get(self._interface_id, {}).get("wps", False)
 
-    @property
-    def name(self):
-        return "%s Wireless [%s] WPS toggle" % (super().name, self._interface_id)
-
-    @property
-    def is_on(self):
-        iface = self.data.get("wireless", {}).get(self._interface_id, {})
-        return iface.get("wps", False)
-
-    async def async_turn_on(self, **kwargs):
+    async def async_turn_on(self, **kwargs) -> None:
         await self._device.set_wps(self._interface_id, True)
 
-    async def async_turn_off(self, **kwargs):
+    async def async_turn_off(self, **kwargs) -> None:
         await self._device.set_wps(self._interface_id, False)
-
-    @property
-    def icon(self):
-        return "mdi:security"
-
-    @property
-    def entity_category(self):
-        return EntityCategory.CONFIG

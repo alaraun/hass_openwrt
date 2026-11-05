@@ -1,13 +1,15 @@
 {
   "domain": "openwrt",
   "name": "OpenWrt",
-  "documentation": "https://github.com/alaraun/hass_openwrt",
-  "issue_tracker": "https://github.com/alaraun/hass_openwrt/issues",
-  "dependencies": [],
-  "codeowners": ["@alaraun"],
-  "requirements": [],
-  "iot_class": "local_polling",
+  "codeowners": [
+    "@alaraun"
+  ],
   "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/alaraun/hass_openwrt",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/alaraun/hass_openwrt/issues",
+  "requirements": [],
   "version": "0.4.0"
 }
-

@@ -1,43 +1,54 @@
 from __future__ import annotations
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import EntityCategory
-
 import logging
+from datetime import UTC, datetime, timedelta
 
-from . import OpenWrtEntity
-from datetime import timedelta, datetime, timezone
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.const import MATCH_ALL, EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
+
+from . import OpenWrtConfigEntry
+from .entity import OpenWrtEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+# A boot time computed from a later poll may differ by the poll's latency and the
+# whole-second uptime; a reboot is recognised by the uptime going down.
+BOOT_TIME_TOLERANCE = timedelta(seconds=60)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities,
+    entry: OpenWrtConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     device = entry.runtime_data
     device_id = entry.data["id"]
+    data = device.data
 
-    entities = []
+    entities: list[SensorEntity] = []
 
     entities.append(HostsSensor(device, device_id))
 
     wireless = []
-    for net_id in device.coordinator.data["wireless"]:
+    for net_id in data["wireless"]:
         sensor = WirelessClientsSensor(device, device_id, net_id)
         wireless.append(sensor)
         entities.append(sensor)
     if wireless:
         entities.append(WirelessTotalClientsSensor(device, device_id, wireless))
 
-    for net_id in device.coordinator.data["mesh"]:
+    for net_id in data["mesh"]:
         entities.append(MeshSignalSensor(device, device_id, net_id))
         entities.append(MeshPeersSensor(device, device_id, net_id))
 
-    mwan3_data = device.coordinator.data.get("mwan3", {})
+    mwan3_data = data.get("mwan3", {})
     if isinstance(mwan3_data, dict):
         for net_id, net_data in mwan3_data.items():
             if not isinstance(net_data, dict):
@@ -53,32 +64,27 @@ async def async_setup_entry(
                     raise ValueError("missing uptime_sec or online_sec")
                 int(uptime)
                 int(online)
-            except Exception as err:
+            except (TypeError, ValueError) as err:
                 _LOGGER.warning(
                     "Skipping mwan3 entry '%s' for device %s: invalid data (%s)",
                     net_id, device_id, err,
                 )
                 continue
             entities.append(Mwan3OnlineSensor(device, device_id, net_id))
-    else:
-        _LOGGER.debug("No valid 'mwan3' data available for device %s", device_id)
 
-    for net_id in device.coordinator.data["wan"]:
+    for net_id in data["wan"]:
         entities.append(WanRxTxSensor(device, device_id, net_id, "rx"))
         entities.append(WanRxTxSensor(device, device_id, net_id, "tx"))
 
-    if "system_info" in device.coordinator.data:
+    if system_info := data.get("system_info"):
         entities.append(SystemUptimeSensor(device, device_id))
         entities.append(SystemLoadSensor(device, device_id))
         entities.append(SystemMemorySensor(device, device_id))
-        if device.coordinator.data["system_info"].get("swap", {}).get("total", 0) > 0:
-            entities.append(SystemDiskSensor(device, device_id, "swap"))
-        if device.coordinator.data["system_info"].get("root", {}).get("total", 0) > 0:
-            entities.append(SystemDiskSensor(device, device_id, "root"))
-        if device.coordinator.data["system_info"].get("tmp", {}).get("total", 0) > 0:
-            entities.append(SystemDiskSensor(device, device_id, "tmp"))
+        for disk in ("swap", "root", "tmp"):
+            if system_info.get(disk, {}).get("total", 0) > 0:
+                entities.append(SystemDiskSensor(device, device_id, disk))
 
-    if device.coordinator.data.get("modem"):
+    if data.get("modem"):
         entities.append(ModemModeSensor(device, device_id))
         entities.append(ModemSignalSensor(device, device_id, "lte_rsrp", "LTE RSRP", "dBm", SensorDeviceClass.SIGNAL_STRENGTH))
         entities.append(ModemSignalSensor(device, device_id, "lte_rsrq", "LTE RSRQ", "dB", None))
@@ -96,166 +102,111 @@ async def async_setup_entry(
 
     async_add_entities(entities)
 
-    # --- Dynamic entity tracking ---
-    # Track which wireless/mesh interface IDs were registered at setup time.
-    _known_wireless_ids: set[str] = set(net_id for net_id in device.coordinator.data["wireless"])
-    _known_mesh_ids: set[str] = set(net_id for net_id in device.coordinator.data["mesh"])
-    # _all_wireless_sensors is the same list object passed to WirelessTotalClientsSensor,
-    # so appending here is automatically reflected in that sensor's .state sum.
-    _all_wireless_sensors = wireless
+    # Wireless and mesh interfaces that appear later get their sensors on the next
+    # poll; vanished ones turn their sensors unavailable (see `available`).
+    known_wireless: set[str] = set(data["wireless"])
+    known_mesh: set[str] = set(data["mesh"])
 
     @callback
     def _on_coordinator_update() -> None:
-        current_wireless = set(device.coordinator.data.get("wireless", {}).keys())
-        current_mesh = set(device.coordinator.data.get("mesh", {}).keys())
+        current = device.data or {}
+        new_entities: list[SensorEntity] = []
+        for net_id in set(current.get("wireless", {})) - known_wireless:
+            sensor = WirelessClientsSensor(device, device_id, net_id)
+            # the total sensor sums this list
+            wireless.append(sensor)
+            new_entities.append(sensor)
+            known_wireless.add(net_id)
+        for net_id in set(current.get("mesh", {})) - known_mesh:
+            new_entities.append(MeshSignalSensor(device, device_id, net_id))
+            new_entities.append(MeshPeersSensor(device, device_id, net_id))
+            known_mesh.add(net_id)
+        if new_entities:
+            async_add_entities(new_entities)
 
-        # New wireless interfaces
-        new_wireless_ids = current_wireless - _known_wireless_ids
-        if new_wireless_ids:
-            new_wireless_sensors = []
-            for net_id in new_wireless_ids:
-                sensor = WirelessClientsSensor(device, device_id, net_id)
-                _all_wireless_sensors.append(sensor)
-                new_wireless_sensors.append(sensor)
-                _known_wireless_ids.add(net_id)
-            async_add_entities(new_wireless_sensors)
-
-        # New mesh interfaces
-        new_mesh_ids = current_mesh - _known_mesh_ids
-        if new_mesh_ids:
-            new_mesh_sensors = []
-            for net_id in new_mesh_ids:
-                new_mesh_sensors.append(MeshSignalSensor(device, device_id, net_id))
-                new_mesh_sensors.append(MeshPeersSensor(device, device_id, net_id))
-                _known_mesh_ids.add(net_id)
-            async_add_entities(new_mesh_sensors)
-
-        # Gone wireless/mesh — entities become unavailable automatically because
-        # WirelessClientsSensor.available, MeshSignalSensor.available, and
-        # MeshPeersSensor.available all check key presence in coordinator data.
-
-    device.coordinator.async_add_listener(_on_coordinator_update)
-
-    return True
+    entry.async_on_unload(device.async_add_listener(_on_coordinator_update))
 
 
 class OpenWrtSensor(OpenWrtEntity, SensorEntity):
     """Base class for OpenWrt sensors."""
 
-    def __init__(self, coordinator, device: str):
-        super().__init__(coordinator, device)
-
-    @property
-    def state_class(self):
-        return "measurement"
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
 
 class WirelessClientsSensor(OpenWrtSensor):
     """Number of clients on a wireless interface."""
 
-    def __init__(self, device, device_id: str, interface: str):
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # per-client signal, IP and name: live only, they change on most polls
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+
+    def __init__(self, device, device_id: str, interface: str) -> None:
         super().__init__(device, device_id)
         self._interface_id = interface
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.clients"
 
     @property
     def interface_id(self) -> str:
         return self._interface_id
 
     @property
-    def available(self) -> bool:
-        return self._interface_id in self.data.get("wireless", {})
+    def _iface(self) -> dict:
+        return self.data.get("wireless", {}).get(self._interface_id, {})
 
     @property
-    def unique_id(self):
-        return "%s.%s.clients" % (super().unique_id, self._interface_id)
+    def available(self) -> bool:
+        return super().available and self._interface_id in self.data.get("wireless", {})
 
     @property
     def name(self):
-        iface_data = self.data.get("wireless", {}).get(self._interface_id, {})
-        ssid = iface_data.get("ssid", self._interface_id)
-        return "%s Wireless [%s] clients" % (super().name, ssid)
+        return "Wireless [%s] clients" % self._iface.get("ssid", self._interface_id)
 
     @property
-    def state(self):
-        iface_data = self.data.get("wireless", {}).get(self._interface_id, {})
-        return iface_data.get("clients", 0)
+    def native_value(self) -> int:
+        return self._iface.get("clients", 0)
 
     @property
     def icon(self):
-        return "mdi:wifi-off" if self.state == 0 else "mdi:wifi"
+        return "mdi:wifi-off" if self.native_value == 0 else "mdi:wifi"
 
     @property
     def extra_state_attributes(self):
         result = dict()
-        data = self.data.get("wireless", {}).get(self._interface_id, {})
-        _LOGGER.debug("Generating attributes for %s with data: %s", self._interface_id, data)
-
-        hosts_data = self.data.get("hosts", {})
-        mac_to_ip = {}
-        mac_to_name = {}
-        for mac, host_info in hosts_data.items():
-            mac_lower = mac.lower()
-            mac_to_ip[mac_lower] = host_info.get("ip", "")
-            mac_to_name[mac_lower] = host_info.get("name", "")
-
+        data = self._iface
+        hosts = {mac.lower(): info for mac, info in self.data.get("hosts", {}).items()}
         for mac, value in data.get("macs", {}).items():
-            mac_lower = mac.lower()
-            signal = value.get("signal", 0)
-            client_info = f"{signal} dBm"
-            if mac_lower in mac_to_ip and mac_to_ip[mac_lower]:
-                client_info += f" | IP: {mac_to_ip[mac_lower]}"
-            if mac_lower in mac_to_name and mac_to_name[mac_lower]:
-                client_info += f" | Name: {mac_to_name[mac_lower]}"
+            host = hosts.get(mac.lower(), {})
+            client_info = f"{value.get('signal', 0)} dBm"
+            if host.get("ip"):
+                client_info += f" | IP: {host['ip']}"
+            if host.get("name"):
+                client_info += f" | Name: {host['name']}"
             result[mac.upper()] = client_info
-
         if "ssid" in data:
             result["ssid"] = data["ssid"]
         return result
-
-    @property
-    def entity_category(self):
-        return EntityCategory.DIAGNOSTIC
 
 
 class MeshSignalSensor(OpenWrtSensor):
     """Signal strength of a mesh interface."""
 
-    def __init__(self, device, device_id: str, interface: str):
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = "dBm"
+
+    def __init__(self, device, device_id: str, interface: str) -> None:
         super().__init__(device, device_id)
         self._interface_id = interface
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.mesh_signal"
+        self._attr_name = f"Mesh [{interface}] signal"
 
     @property
     def available(self) -> bool:
-        return self._interface_id in self.data.get("mesh", {})
-
-    @property
-    def unique_id(self):
-        return "%s.%s.mesh_signal" % (super().unique_id, self._interface_id)
-
-    @property
-    def name(self):
-        return f"{super().name} Mesh [{self._interface_id}] signal"
+        return super().available and self._interface_id in self.data.get("mesh", {})
 
     @property
     def native_value(self):
         return self.data.get("mesh", {}).get(self._interface_id, {}).get("signal", None)
-
-    @property
-    def native_unit_of_measurement(self):
-        return "dBm"
-
-    @property
-    def device_class(self):
-        return SensorDeviceClass.SIGNAL_STRENGTH
-
-    @property
-    def _signal_level(self):
-        value = self.native_value
-        levels = [-50, -60, -67, -70, -80]
-        for idx, level in enumerate(levels):
-            if value >= level:
-                return idx
-        return len(levels)
 
     @property
     def icon(self):
@@ -267,77 +218,69 @@ class MeshSignalSensor(OpenWrtSensor):
             "mdi:network-strength-outline",
             "mdi:network-strength-off-outline",
         ]
-        return icons[self._signal_level]
-
-    @property
-    def entity_category(self):
-        return EntityCategory.DIAGNOSTIC
+        value = self.native_value
+        if value is None:
+            return icons[-1]
+        for idx, level in enumerate([-50, -60, -67, -70, -80]):
+            if value >= level:
+                return icons[idx]
+        return icons[-1]
 
 
 class MeshPeersSensor(OpenWrtSensor):
     """Number of active mesh peers on a mesh interface."""
 
-    def __init__(self, device, device_id: str, interface: str):
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+
+    def __init__(self, device, device_id: str, interface: str) -> None:
         super().__init__(device, device_id)
         self._interface_id = interface
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.mesh_peers"
+        self._attr_name = f"Mesh [{interface}] peers"
+
+    @property
+    def _peers(self) -> dict:
+        return self.data.get("mesh", {}).get(self._interface_id, {}).get("peers", {})
 
     @property
     def available(self) -> bool:
-        return self._interface_id in self.data.get("mesh", {})
+        return super().available and self._interface_id in self.data.get("mesh", {})
 
     @property
-    def unique_id(self):
-        return "%s.%s.mesh_peers" % (super().unique_id, self._interface_id)
-
-    @property
-    def name(self):
-        return f"{super().name} Mesh [{self._interface_id}] peers"
-
-    @property
-    def state(self):
-        peers = self.data.get("mesh", {}).get(self._interface_id, {}).get("peers", {})
-        return len([p for p in peers.values() if p.get("active")])
+    def native_value(self) -> int:
+        return len([p for p in self._peers.values() if p.get("active")])
 
     @property
     def icon(self):
-        return "mdi:server-network" if self.state > 0 else "mdi:server-network-off"
+        return "mdi:server-network" if self.native_value > 0 else "mdi:server-network-off"
 
     @property
     def extra_state_attributes(self):
-        result = dict()
-        data = self.data.get("mesh", {}).get(self._interface_id, {})
-        for key, value in data.get("peers", {}).items():
-            signal = value.get("signal", 0)
-            result[key.upper()] = f"{signal} dBm"
-        return result
-
-    @property
-    def entity_category(self):
-        return EntityCategory.DIAGNOSTIC
+        return {
+            mac.upper(): f"{value.get('signal', 0)} dBm"
+            for mac, value in self._peers.items()
+        }
 
 
 class WirelessTotalClientsSensor(OpenWrtSensor):
     """Total number of clients across all wireless interfaces."""
 
-    def __init__(self, device, device_id: str, sensors):
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+    _attr_name = "Wireless total clients"
+
+    def __init__(self, device, device_id: str, sensors: list[WirelessClientsSensor]) -> None:
         super().__init__(device, device_id)
         self._sensors = sensors
+        self._attr_unique_id = f"{self._attr_unique_id}.total_clients"
 
     @property
-    def unique_id(self):
-        return "%s.total_clients" % super().unique_id
-
-    @property
-    def name(self):
-        return "%s Wireless total clients" % super().name
-
-    @property
-    def state(self):
-        return sum(s.state for s in self._sensors if s.available)
+    def native_value(self) -> int:
+        return sum(s.native_value for s in self._sensors if s.available)
 
     @property
     def icon(self):
-        return "mdi:wifi-off" if self.state == 0 else "mdi:wifi"
+        return "mdi:wifi-off" if self.native_value == 0 else "mdi:wifi"
 
     @property
     def extra_state_attributes(self):
@@ -348,31 +291,26 @@ class WirelessTotalClientsSensor(OpenWrtSensor):
             ssid = sensor.data["wireless"][sensor.interface_id].get(
                 "ssid", sensor.interface_id
             )
-            result[ssid] = sensor.state
+            result[ssid] = sensor.native_value
         return result
 
 
 class Mwan3OnlineSensor(OpenWrtSensor):
     """Online ratio of a WAN interface managed by mwan3."""
 
-    def __init__(self, device, device_id: str, interface: str):
+    _attr_native_unit_of_measurement = "%"
+    _attr_icon = "mdi:router-network"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, device, device_id: str, interface: str) -> None:
         super().__init__(device, device_id)
         self._interface_id = interface
-        self._attr_native_unit_of_measurement = "%"
-        self._attr_icon = "mdi:router-network"
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.mwan3_online_ratio"
+        self._attr_name = f"Mwan3 [{interface}] online ratio"
 
     @property
-    def available(self):
-        return self._interface_id in self.data["mwan3"]
-
-    @property
-    def unique_id(self):
-        return "%s.%s.mwan3_online_ratio" % (super().unique_id, self._interface_id)
-
-    @property
-    def name(self):
-        return f"{super().name} Mwan3 [{self._interface_id}] online ratio"
+    def available(self) -> bool:
+        return super().available and self._interface_id in self.data.get("mwan3", {})
 
     @property
     def native_value(self):
@@ -385,30 +323,26 @@ class Mwan3OnlineSensor(OpenWrtSensor):
 class WanRxTxSensor(OpenWrtSensor):
     """RX or TX byte counter for a WAN interface."""
 
-    def __init__(self, device, device_id: str, interface: str, code: str):
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_native_unit_of_measurement = "B"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, device, device_id: str, interface: str, code: str) -> None:
         super().__init__(device, device_id)
         self._interface = interface
         self._code = code
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
         self._attr_icon = "mdi:download-network" if code == "rx" else "mdi:upload-network"
-        self._attr_device_class = SensorDeviceClass.DATA_SIZE
-        self._attr_native_unit_of_measurement = "B"
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.wan_{code}_bytes"
+        self._attr_name = f"Wan [{interface}] {code.capitalize()} bytes"
 
     @property
-    def _data(self):
-        return self.data["wan"].get(self._interface)
+    def _data(self) -> dict:
+        return self.data.get("wan", {}).get(self._interface, {})
 
     @property
-    def available(self):
-        return self._interface in self.data["wan"] and self._data.get("up")
-
-    @property
-    def unique_id(self):
-        return "%s.%s.wan_%s_bytes" % (super().unique_id, self._interface, self._code)
-
-    @property
-    def name(self):
-        return f"{super().name} Wan [{self._interface}] {self._code.capitalize()} bytes"
+    def available(self) -> bool:
+        return super().available and bool(self._data.get("up"))
 
     @property
     def native_value(self):
@@ -418,116 +352,113 @@ class WanRxTxSensor(OpenWrtSensor):
     def extra_state_attributes(self):
         return dict(mac=self._data.get("mac"), speed=self._data.get("speed"))
 
-    @property
-    def state_class(self):
-        return "total_increasing"
-
 
 class HostsSensor(OpenWrtSensor):
     """Number of known hosts in the router."""
 
-    def __init__(self, device, device_id: str):
+    _attr_icon = "mdi:devices"
+    _attr_name = "Known Hosts"
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+
+    def __init__(self, device, device_id: str) -> None:
         super().__init__(device, device_id)
-        self._attr_icon = "mdi:devices"
+        self._attr_unique_id = f"{self._attr_unique_id}.hosts"
 
     @property
-    def unique_id(self):
-        return "%s.hosts" % super().unique_id
-
-    @property
-    def name(self):
-        return f"{super().name} Known Hosts"
-
-    @property
-    def state(self):
+    def native_value(self) -> int:
         return len(self.data.get("hosts", {}))
 
     @property
     def extra_state_attributes(self):
-        hosts = self.data.get("hosts", {})
         ip_to_host = {}
-        for mac, host_data in hosts.items():
-            ip = host_data.get("ip", "")
-            if ip:
+        for mac, host_data in self.data.get("hosts", {}).items():
+            if ip := host_data.get("ip", ""):
                 ip_to_host[ip] = {"name": host_data.get("name", ""), "mac": mac}
+        return {
+            ip: f"{ip_to_host[ip]['name'] or 'Unknown'} : {ip_to_host[ip]['mac']}"
+            for ip in sorted(ip_to_host, key=self._sort_ip)
+        }
 
-        result = {}
-        for ip in sorted(ip_to_host.keys(), key=self._sort_ip):
-            host_info = ip_to_host[ip]
-            name = host_info["name"] if host_info["name"] else "Unknown"
-            result[ip] = f"{name} : {host_info['mac']}"
-        return result
-
-    def _sort_ip(self, ip):
+    @staticmethod
+    def _sort_ip(ip):
         try:
             return [int(n) for n in ip.split(".")]
         except (ValueError, AttributeError):
             return [999, 999, 999, 999]
 
 
-class SystemUptimeSensor(OpenWrtSensor):
-    """System uptime sensor."""
+class _SystemInfoSensor(OpenWrtSensor):
+    """A sensor of the `system info` data; unavailable while it could not be read."""
 
-    def __init__(self, device, device_id: str):
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def _system_info(self) -> dict:
+        return self.data.get("system_info", {})
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self._system_info)
+
+
+class SystemUptimeSensor(_SystemInfoSensor):
+    """Boot time of the device (state changes only on a reboot)."""
+
+    _attr_icon = "mdi:clock-outline"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_state_class = None
+    _attr_name = "System uptime"
+
+    def __init__(self, device, device_id: str) -> None:
         super().__init__(device, device_id)
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_icon = "mdi:clock-outline"
+        self._attr_unique_id = f"{self._attr_unique_id}.system_uptime"
+        self._boot_time: datetime | None = None
+        self._last_uptime = 0
+        self._update_boot_time()
+
+    def _update_boot_time(self) -> None:
+        uptime = self._system_info.get("uptime", 0)
+        if not uptime:
+            return
+        boot_time = dt_util.utcnow().replace(microsecond=0) - timedelta(seconds=uptime)
+        if (
+            self._boot_time is None
+            or uptime < self._last_uptime
+            or abs(boot_time - self._boot_time) > BOOT_TIME_TOLERANCE
+        ):
+            self._boot_time = boot_time
+        self._last_uptime = uptime
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_boot_time()
+        super()._handle_coordinator_update()
 
     @property
-    def state_class(self):
-        return None  # uptime is formatted as a string, not a numeric measurement
-
-    @property
-    def unique_id(self):
-        return "%s.system_uptime" % super().unique_id
-
-    @property
-    def name(self):
-        return f"{super().name} System uptime"
-
-    @property
-    def state(self):
-        seconds = self.data.get("system_info", {}).get("uptime", 0)
-        delta = timedelta(seconds=seconds)
-        days = delta.days
-        hours = delta.seconds // 3600
-        minutes = (delta.seconds % 3600) // 60
-        if days > 0:
-            return f"{days}d {hours}h {minutes}m"
-        if hours > 0:
-            return f"{hours}h {minutes}m"
-        return f"{minutes}m"
-
-    @property
-    def extra_state_attributes(self):
-        return {"seconds": self.data.get("system_info", {}).get("uptime", 0)}
+    def native_value(self) -> datetime | None:
+        return self._boot_time
 
 
-class SystemMemorySensor(OpenWrtSensor):
+class SystemMemorySensor(_SystemInfoSensor):
     """Free system memory sensor."""
 
-    def __init__(self, device, device_id: str):
+    _attr_icon = "mdi:memory"
+    _attr_native_unit_of_measurement = "MB"
+    _attr_name = "System memory free"
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+
+    def __init__(self, device, device_id: str) -> None:
         super().__init__(device, device_id)
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_icon = "mdi:memory"
-        self._attr_native_unit_of_measurement = "MB"
-
-    @property
-    def unique_id(self):
-        return "%s.system_memory_free" % super().unique_id
-
-    @property
-    def name(self):
-        return f"{super().name} System memory free"
+        self._attr_unique_id = f"{self._attr_unique_id}.system_memory_free"
 
     @property
     def native_value(self):
-        memory = self.data.get("system_info", {}).get("memory", {})
+        memory = self._system_info.get("memory", {})
         return round(memory.get("free", 0) / (1024 * 1024), 1)
 
     @property
     def extra_state_attributes(self):
-        memory = self.data.get("system_info", {}).get("memory", {})
+        memory = self._system_info.get("memory", {})
         return {
             "total_mb": round(memory.get("total", 0) / (1024 * 1024), 1),
             "free_mb": round(memory.get("free", 0) / (1024 * 1024), 1),
@@ -535,38 +466,35 @@ class SystemMemorySensor(OpenWrtSensor):
             "cached_mb": round(memory.get("cached", 0) / (1024 * 1024), 1),
             "available_mb": round(memory.get("available", 0) / (1024 * 1024), 1),
             "used_percent": round(
-                (1 - memory.get("free", 0) / memory.get("total", 1)) * 100, 1
+                (1 - memory.get("free", 0) / (memory.get("total") or 1)) * 100, 1
             ),
         }
 
 
-class SystemLoadSensor(OpenWrtSensor):
+class SystemLoadSensor(_SystemInfoSensor):
     """System 1-minute load average sensor."""
 
-    def __init__(self, device, device_id: str):
+    _attr_icon = "mdi:cpu-64-bit"
+    _attr_name = "System load"
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+
+    def __init__(self, device, device_id: str) -> None:
         super().__init__(device, device_id)
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_icon = "mdi:cpu-64-bit"
+        self._attr_unique_id = f"{self._attr_unique_id}.system_load"
 
     @property
-    def unique_id(self):
-        return "%s.system_load" % super().unique_id
-
-    @property
-    def name(self):
-        return f"{super().name} System load"
+    def _load(self) -> list:
+        return self._system_info.get("load") or [0, 0, 0]
 
     @property
     def native_value(self):
-        load = self.data.get("system_info", {}).get("load", [0, 0, 0])
-        if load and len(load) >= 1:
-            return round(load[0] / 65536, 2)
-        return 0
+        # system.info reports the load averages in 1/65536 units
+        return round(self._load[0] / 65536, 2)
 
     @property
     def extra_state_attributes(self):
-        load = self.data.get("system_info", {}).get("load", [0, 0, 0])
-        if load and len(load) >= 3:
+        load = self._load
+        if len(load) >= 3:
             return {
                 "load_1min": round(load[0] / 65536, 2),
                 "load_5min": round(load[1] / 65536, 2),
@@ -575,27 +503,22 @@ class SystemLoadSensor(OpenWrtSensor):
         return {}
 
 
-class SystemDiskSensor(OpenWrtSensor):
+class SystemDiskSensor(_SystemInfoSensor):
     """Disk usage sensor (swap, root, tmp)."""
 
-    def __init__(self, device, device_id: str, disk_type: str):
+    _attr_icon = "mdi:harddisk"
+    _attr_native_unit_of_measurement = "%"
+    _unrecorded_attributes = frozenset({MATCH_ALL})
+
+    def __init__(self, device, device_id: str, disk_type: str) -> None:
         super().__init__(device, device_id)
         self._disk_type = disk_type
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_icon = "mdi:harddisk"
-        self._attr_native_unit_of_measurement = "%"
-
-    @property
-    def unique_id(self):
-        return f"{super().unique_id}.{self._disk_type}_usage"
-
-    @property
-    def name(self):
-        return f"{super().name} {self._disk_type.capitalize()} usage"
+        self._attr_unique_id = f"{self._attr_unique_id}.{disk_type}_usage"
+        self._attr_name = f"{disk_type.capitalize()} usage"
 
     @property
     def native_value(self):
-        disk_info = self.data.get("system_info", {}).get(self._disk_type, {})
+        disk_info = self._system_info.get(self._disk_type, {})
         total = disk_info.get("total", 0)
         free = disk_info.get("free", 0)
         if total > 0:
@@ -604,7 +527,7 @@ class SystemDiskSensor(OpenWrtSensor):
 
     @property
     def extra_state_attributes(self):
-        disk_info = self.data.get("system_info", {}).get(self._disk_type, {})
+        disk_info = self._system_info.get(self._disk_type, {})
         return {
             "total_kb": disk_info.get("total", 0),
             "free_kb": disk_info.get("free", 0),
@@ -613,43 +536,30 @@ class SystemDiskSensor(OpenWrtSensor):
         }
 
 
-def _epoch_to_iso(ts) -> str | None:
-    """Convert a Unix epoch int to an ISO-8601 string, or None."""
-    if ts is None:
-        return None
-    try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
-    except (TypeError, ValueError):
-        return None
+class _ModemSensor(OpenWrtSensor):
+    """A sensor of the modem stats file; unavailable while the file is missing."""
 
-
-class ModemModeSensor(OpenWrtSensor):
-    """Current connection mode (LTE / 5G NSA / 5G SA) with all modem stats as attributes."""
-
-    def __init__(self, device, device_id: str):
-        super().__init__(device, device_id)
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_icon = "mdi:signal-5g"
-
-    @property
-    def state_class(self):
-        return None
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def _modem(self) -> dict:
         return self.data.get("modem", {})
 
     @property
-    def available(self):
-        return bool(self._modem)
+    def available(self) -> bool:
+        return super().available and bool(self._modem)
 
-    @property
-    def unique_id(self):
-        return f"{super().unique_id}.modem_mode"
 
-    @property
-    def name(self):
-        return f"{super().name} Modem mode"
+class ModemModeSensor(_ModemSensor):
+    """Current connection mode (LTE / 5G NSA / 5G SA) with the modem's details as attributes."""
+
+    _attr_icon = "mdi:signal-5g"
+    _attr_state_class = None
+    _attr_name = "Modem mode"
+
+    def __init__(self, device, device_id: str) -> None:
+        super().__init__(device, device_id)
+        self._attr_unique_id = f"{self._attr_unique_id}.modem_mode"
 
     @property
     def native_value(self):
@@ -657,66 +567,39 @@ class ModemModeSensor(OpenWrtSensor):
 
     @property
     def extra_state_attributes(self):
+        # The collection time is the "Modem last update" sensor, not an attribute
+        # here, so the attributes change only with the cell or the registration.
         m = self._modem
         return {
-            "operator": m.get("operator"),
-            "mcc_mnc": m.get("mcc_mnc"),
-            "bands": m.get("bands"),
-            "pcc_band": m.get("pcc_band"),
-            "nr_band": m.get("nr_band"),
-            "registered": m.get("registered"),
-            "tac_hex": m.get("tac_hex"),
-            "tac_dec": m.get("tac_dec"),
-            "cell_id_hex": m.get("cell_id_hex"),
-            "cell_id_dec": m.get("cell_id_dec"),
-            "lte_pci": m.get("lte_pci"),
-            "lte_earfcn": m.get("lte_earfcn"),
-            "nr_pci": m.get("nr_pci"),
-            "nr_earfcn": m.get("nr_earfcn"),
-            "firmware": m.get("firmware"),
-            "model": m.get("model"),
-            "manufacturer": m.get("manufacturer"),
-            "imei": m.get("imei"),
-            "iccid": m.get("iccid"),
-            "sim_slot": m.get("sim_slot"),
-            "proto": m.get("proto"),
-            "iface": m.get("iface"),
-            "last_update": _epoch_to_iso(m.get("timestamp")),
+            key: m.get(key)
+            for key in (
+                "operator", "mcc_mnc", "bands", "pcc_band", "nr_band", "registered",
+                "tac_hex", "tac_dec", "cell_id_hex", "cell_id_dec", "lte_pci",
+                "lte_earfcn", "nr_pci", "nr_earfcn", "firmware", "model",
+                "manufacturer", "imei", "iccid", "sim_slot", "proto", "iface",
+            )
         }
 
 
-class ModemSignalSensor(OpenWrtSensor):
+class ModemSignalSensor(_ModemSensor):
     """Single numeric modem signal metric (RSRP, RSRQ, SINR, temp, ...)."""
 
-    def __init__(self, device, device_id: str, key: str, label: str, unit: str, device_class):
+    def __init__(self, device, device_id: str, key: str, label: str, unit: str, device_class) -> None:
         super().__init__(device, device_id)
         self._key = key
-        self._label = label
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
         self._attr_native_unit_of_measurement = unit
         self._attr_device_class = device_class
-        self._attr_icon = "mdi:thermometer" if "temp" in key else None
+        self._attr_unique_id = f"{self._attr_unique_id}.modem_{key}"
+        self._attr_name = f"Modem {label}"
 
     @property
-    def _modem(self) -> dict:
-        return self.data.get("modem", {})
-
-    @property
-    def available(self):
-        return bool(self._modem) and self._modem.get(self._key) is not None
-
-    @property
-    def unique_id(self):
-        return f"{super().unique_id}.modem_{self._key}"
-
-    @property
-    def name(self):
-        return f"{super().name} Modem {self._label}"
+    def available(self) -> bool:
+        return super().available and self._modem.get(self._key) is not None
 
     @property
     def icon(self):
-        if self._attr_icon:  # thermometer
-            return self._attr_icon
+        if "temp" in self._key:
+            return "mdi:thermometer"
         val = self.native_value
         if val is None:
             return "mdi:signal-cellular-outline"
@@ -745,37 +628,23 @@ class ModemSignalSensor(OpenWrtSensor):
             return None
 
 
-class ModemTrafficSensor(OpenWrtSensor):
+class ModemTrafficSensor(_ModemSensor):
     """Cumulative RX/TX byte or packet counter for the modem interface."""
 
-    def __init__(self, device, device_id: str, key: str, label: str, unit: str, device_class):
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, device, device_id: str, key: str, label: str, unit: str, device_class) -> None:
         super().__init__(device, device_id)
         self._key = key
-        self._label = label
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
         self._attr_native_unit_of_measurement = unit
         self._attr_device_class = device_class
         self._attr_icon = "mdi:download-network" if key.startswith("rx") else "mdi:upload-network"
+        self._attr_unique_id = f"{self._attr_unique_id}.modem_{key}"
+        self._attr_name = f"Modem {label}"
 
     @property
-    def state_class(self):
-        return "total_increasing"
-
-    @property
-    def _modem(self) -> dict:
-        return self.data.get("modem", {})
-
-    @property
-    def available(self):
-        return bool(self._modem) and self._modem.get(self._key) is not None
-
-    @property
-    def unique_id(self):
-        return f"{super().unique_id}.modem_{self._key}"
-
-    @property
-    def name(self):
-        return f"{super().name} Modem {self._label}"
+    def available(self) -> bool:
+        return super().available and self._modem.get(self._key) is not None
 
     @property
     def native_value(self):
@@ -788,34 +657,17 @@ class ModemTrafficSensor(OpenWrtSensor):
             return None
 
 
-class ModemTimestampSensor(OpenWrtSensor):
+class ModemTimestampSensor(_ModemSensor):
     """Timestamp of the last modem stats collection run."""
 
-    def __init__(self, device, device_id: str):
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-outline"
+    _attr_state_class = None
+    _attr_name = "Modem last update"
+
+    def __init__(self, device, device_id: str) -> None:
         super().__init__(device, device_id)
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_class = SensorDeviceClass.TIMESTAMP
-        self._attr_icon = "mdi:clock-outline"
-
-    @property
-    def state_class(self):
-        return None  # timestamps have no state_class
-
-    @property
-    def _modem(self) -> dict:
-        return self.data.get("modem", {})
-
-    @property
-    def available(self):
-        return bool(self._modem)
-
-    @property
-    def unique_id(self):
-        return f"{super().unique_id}.modem_timestamp"
-
-    @property
-    def name(self):
-        return f"{super().name} Modem last update"
+        self._attr_unique_id = f"{self._attr_unique_id}.modem_timestamp"
 
     @property
     def native_value(self):
@@ -823,6 +675,6 @@ class ModemTimestampSensor(OpenWrtSensor):
         if ts is None:
             return None
         try:
-            return datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        except (TypeError, ValueError):
+            return datetime.fromtimestamp(int(ts), tz=UTC)
+        except (TypeError, ValueError, OverflowError, OSError):
             return None

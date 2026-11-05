@@ -1,74 +1,59 @@
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from __future__ import annotations
+
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-import logging
-
-from . import OpenWrtEntity
-
-_LOGGER = logging.getLogger(__name__)
+from . import OpenWrtConfigEntry
+from .entity import OpenWrtEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities,
+    entry: OpenWrtConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     device = entry.runtime_data
     device_id = entry.data["id"]
 
-    entities = [OpenWrtBinarySensor(device, device_id)]
+    entities: list[BinarySensorEntity] = [OpenWrtBinarySensor(device, device_id)]
 
-    for net_id in device.coordinator.data["mwan3"]:
+    for net_id in device.data["mwan3"]:
         entities.append(Mwan3OnlineBinarySensor(device, device_id, net_id))
 
-    if device.coordinator.data.get("modem"):
+    if device.data.get("modem"):
         entities.append(ModemRegisteredBinarySensor(device, device_id))
 
     async_add_entities(entities)
-    return True
 
 
 class OpenWrtBinarySensor(OpenWrtEntity, BinarySensorEntity):
+    """On while the device answers; unavailable while a poll fails."""
 
-    def __init__(self, device, device_id: str):
-        super().__init__(device, device_id)
-
-    @property
-    def is_on(self):
-        return True
-
-    @property
-    def device_class(self):
-        return "connectivity"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_is_on = True
 
 
 class Mwan3OnlineBinarySensor(OpenWrtEntity, BinarySensorEntity):
 
-    def __init__(self, device, device_id: str, interface: str):
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, device, device_id: str, interface: str) -> None:
         super().__init__(device, device_id)
         self._interface_id = interface
+        self._attr_unique_id = f"{self._attr_unique_id}.{interface}.mwan3_online"
+        self._attr_name = f"Mwan3 [{interface}] online"
 
     @property
-    def available(self):
-        return self._interface_id in self.data["mwan3"]
+    def available(self) -> bool:
+        return super().available and self._interface_id in self.data.get("mwan3", {})
 
     @property
-    def unique_id(self):
-        return "%s.%s.mwan3_online" % (super().unique_id, self._interface_id)
-
-    @property
-    def name(self):
-        return f"{super().name} Mwan3 [{self._interface_id}] online"
-
-    @property
-    def is_on(self):
-        data = self.data["mwan3"].get(self._interface_id, {})
-        return data.get("online", False)
-
-    @property
-    def device_class(self):
-        return "connectivity"
+    def is_on(self) -> bool:
+        return self.data["mwan3"].get(self._interface_id, {}).get("online", False)
 
     @property
     def icon(self):
@@ -78,32 +63,24 @@ class Mwan3OnlineBinarySensor(OpenWrtEntity, BinarySensorEntity):
 class ModemRegisteredBinarySensor(OpenWrtEntity, BinarySensorEntity):
     """Whether the modem is registered on the mobile network."""
 
-    def __init__(self, device, device_id: str):
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_name = "Modem registered"
+
+    def __init__(self, device, device_id: str) -> None:
         super().__init__(device, device_id)
+        self._attr_unique_id = f"{self._attr_unique_id}.modem_registered"
 
     @property
     def _modem(self) -> dict:
         return self.data.get("modem", {})
 
     @property
-    def available(self):
-        return bool(self._modem)
+    def available(self) -> bool:
+        return super().available and bool(self._modem)
 
     @property
-    def unique_id(self):
-        return f"{super().unique_id}.modem_registered"
-
-    @property
-    def name(self):
-        return f"{super().name} Modem registered"
-
-    @property
-    def is_on(self):
+    def is_on(self) -> bool:
         return bool(self._modem.get("registered", False))
-
-    @property
-    def device_class(self):
-        return "connectivity"
 
     @property
     def icon(self):

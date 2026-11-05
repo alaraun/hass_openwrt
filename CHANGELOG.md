@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 <!--next-version-placeholder-->
 
+## Unreleased
+
+### Changed
+
+- **System uptime** is a timestamp sensor holding the boot time; its state changes only on a reboot (it was a text such as `14d 23h 32m` with a `seconds` attribute, rewritten on every poll).
+- Attributes that change on most polls (per-client details, mesh peers, known hosts, per-SSID totals, memory, load and disk details) are no longer recorded; they stay visible live.
+- The modem mode sensor drops the `last_update` attribute (use the `Modem last update` sensor).
+- A failed poll marks the device's entities unavailable; they no longer keep the previous values or show zeros.
+
+### Fixed
+
+- A call that timed out was logged as `failed to get system info:` with an empty reason and the poll went on with zero values. Timeouts and malformed replies are connection errors: the poll fails with a message that names the device, the call and the timeout.
+- Debug logging wrote the login password and the session id.
+- A rejected password starts Home Assistant's re-authentication; reauth used to open the setup form again. A login refused while the router boots is retried instead.
+- A call the ACL does not allow, or an optional call (mwan3, WAN status, board info) that fails, no longer fails the whole poll.
+- The dynamic sensor listener is removed when the entry unloads.
+
+### Internal
+
+- The coordinator subclasses `DataUpdateCoordinator` with its config entry; entities use `has_entity_name` (entity ids and friendly names unchanged) and a shared `entity.py`.
+- Diagnostics platform; `integration_type: device` in the manifest.
+- Test suite (`tests/`, pytest-homeassistant-custom-component) with a fake ubus endpoint.
+
 ## v0.4.0
 
 ### Added
