@@ -46,7 +46,8 @@ recorded as before. The modem mode sensor no longer carries the collection time
 
 A poll that fails (the router does not answer within 15 s, or the connection drops) marks the
 device's entities unavailable until the next successful poll; Home Assistant logs the failure
-once, naming the device and the call, and logs the recovery.
+once, naming the device and the call, and logs the recovery. While Home Assistant starts, the
+integration reads each device once and then waits for the start to finish before polling.
 
 ## Installing
 

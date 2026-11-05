@@ -7,7 +7,7 @@ import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util.json import json_loads
@@ -558,7 +558,9 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        if self.hass.is_stopping:
+        if self.data is not None and self.hass.state is not CoreState.running:
+            # Polls wait for Home Assistant to finish starting: on a busy host its
+            # start delays the replies past the timeout. The first refresh runs.
             return self.data
         try:
             if not self._apis:

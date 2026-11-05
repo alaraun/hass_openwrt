@@ -158,6 +158,21 @@ async def test_system_info_timeout_fails_the_poll_with_a_message(
     assert hass.states.get(MEMORY).state == "256.0"
 
 
+async def test_polls_wait_until_home_assistant_has_started(hass, router, make_entry, freezer):
+    from homeassistant.core import CoreState
+
+    hass.set_state(CoreState.starting)
+    await _setup(hass, make_entry())  # the first refresh runs while starting
+    assert hass.states.get(CLIENTS).state == "1"
+    calls = len(router.calls)
+    await _poll(hass, freezer)
+    assert len(router.calls) == calls
+    assert hass.states.get(ONLINE).state == "on"
+    hass.set_state(CoreState.running)
+    await _poll(hass, freezer)
+    assert len(router.calls) > calls
+
+
 async def test_system_info_rpc_error_leaves_other_sensors(hass, router, make_entry, freezer):
     await _setup(hass, make_entry())
     router.answers[("system", "info")] = Status(2)

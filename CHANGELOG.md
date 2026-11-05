@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - A call that timed out was logged as `failed to get system info:` with an empty reason and the poll went on with zero values. Timeouts and malformed replies are connection errors: the poll fails with a message that names the device, the call and the timeout.
+- Polls wait until Home Assistant has finished starting (the first refresh still runs): on a busy host, the calls made while other integrations start could wait out the 15 s timeout on every router at once.
 - Debug logging wrote the login password and the session id.
 - A rejected password starts Home Assistant's re-authentication; reauth used to open the setup form again. A login refused while the router boots is retried instead.
 - A call the ACL does not allow, or an optional call (mwan3, WAN status, board info) that fails, no longer fails the whole poll.
