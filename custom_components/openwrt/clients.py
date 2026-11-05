@@ -95,7 +95,8 @@ def claim(hass: HomeAssistant, entry: ConfigEntry, domain: str, mac: str, unique
     """Claim a client entity for `entry` unless another entry owns it."""
     claims = hass.data.setdefault(_CLAIMS, {})
     owner = claims.get((domain, mac))
-    if owner is not None:
+    # an owner deleted while not loaded released nothing: its claim is stale
+    if owner is not None and hass.config_entries.async_get_entry(owner) is not None:
         return owner == entry.entry_id
     entity_id = er.async_get(hass).async_get_entity_id(domain, DOMAIN, unique_id)
     if entity_id is not None:

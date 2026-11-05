@@ -15,6 +15,8 @@ from pytest_homeassistant_custom_component.common import (
 
 from .conftest import CLIENT_MAC, HOST_IP
 
+OTHER_MAC = "02:00:00:00:00:0b"
+
 TRACKER = "device_tracker.laptop"
 SIGNAL = "sensor.laptop_wi_fi_signal"
 TRACKER_UID = f"openwrt.client.{CLIENT_MAC}"
@@ -280,16 +282,14 @@ async def test_claim_before_the_registry_has_the_entity(hass):
     from custom_components.openwrt.clients import claim, release_claims
 
     first, second = MockConfigEntry(domain="openwrt"), MockConfigEntry(domain="openwrt")
+    first.add_to_hass(hass)
+    second.add_to_hass(hass)
     uid = "openwrt.client.02:00:00:00:00:03"
     assert claim(hass, first, "device_tracker", "02:00:00:00:00:03", uid)
     assert not claim(hass, second, "device_tracker", "02:00:00:00:00:03", uid)
     assert claim(hass, first, "device_tracker", "02:00:00:00:00:03", uid)
     release_claims(hass, first)
     assert claim(hass, second, "device_tracker", "02:00:00:00:00:03", uid)
-
-
-async def _tick(hass, freezer, seconds: float = 31) -> None:
-    await _poll(hass, freezer, seconds)
 
 
 async def test_failing_router_does_not_block_not_home(hass, router_factory, make_entry, freezer):
@@ -425,5 +425,126 @@ async def test_upper_case_hostapd_mac_is_one_client(hass, router, make_entry):
     _enabled(hass, entry)
     await _setup_loaded(hass, entry)
     assert hass.states.get(TRACKER).state == "home"
+    trackers = [e for e in er.async_get(hass).entities.values() if e.domain == "device_tracker"]
+    assert len(trackers) == 1
+
+
+async def test_claim_of_a_deleted_unloaded_owner_is_dropped(hass, router_factory, make_entry):
+    """An owner deleted while not loaded releases no claim; another router takes over."""
+    first, second = await _two_routers(hass, router_factory, make_entry)
+    entry_a, entry_b = hass.config_entries.async_entries("openwrt")
+    assert await hass.config_entries.async_unload(entry_a.entry_id)
+    second.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {CLIENT_MAC: {"signal": -60}}}
+    await _poll_only(hass, entry_b)  # caches the unloaded owner
+    assert await hass.config_entries.async_remove(entry_a.entry_id)
+    await hass.async_block_till_done()
+    await _poll_only(hass, entry_b)
+    trackers = [e for e in er.async_get(hass).entities.values() if e.domain == "device_tracker"]
+    assert [t.config_entry_id for t in trackers] == [entry_b.entry_id]
+
+
+async def test_one_confirming_poll_confirms_every_client_that_left(hass, router_factory, make_entry):
+    first = await router_factory()
+    second = await router_factory()
+    second.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {}}
+    first.answers[("hostapd.phy0-ap0", "get_clients")] = {
+        "clients": {CLIENT_MAC: {"signal": -50}, OTHER_MAC: {"signal": -50}}
+    }
+    entry_a = make_entry(first, id="ap-a", unique_id="a")
+    _enabled(hass, entry_a)
+    _enabled(hass, entry_a, mac=OTHER_MAC, object_id="phone")
+    await _setup_loaded(hass, entry_a)
+    await _setup(hass, make_entry(second, id="ap-b", unique_id="b"))
+    assert hass.states.get("device_tracker.phone").state == "home"
+    b_polls = len(second.calls_of("system", "info"))
+    first.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {}}
+    await _poll_only(hass, entry_a)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert len(second.calls_of("system", "info")) - b_polls == 1
+    assert hass.states.get(TRACKER).state == "not_home"
+    assert hass.states.get("device_tracker.phone").state == "not_home"
+
+
+async def test_poll_in_flight_at_the_departure_does_not_confirm(hass, router_factory, make_entry):
+    """B's poll started before the client left A and ends without it: the tracker waits
+    for a poll started after the departure, requested again once B is free."""
+    import asyncio
+
+    first, second = await _two_routers(hass, router_factory, make_entry)
+    entry_a, entry_b = hass.config_entries.async_entries("openwrt")
+    release = asyncio.Event()
+    hints = second.answers[("luci-rpc", "getHostHints")]
+    held = []
+
+    async def _held_once(params):
+        if not held:
+            held.append(True)
+            await release.wait()
+        return hints
+
+    second.answers[("luci-rpc", "getHostHints")] = _AsyncAnswer(_held_once)
+    in_flight = hass.async_create_task(entry_b.runtime_data.async_refresh())
+    await asyncio.sleep(0.05)
+    assert held
+    first.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {}}
+    await entry_a.runtime_data.async_refresh()
+    await asyncio.sleep(0.05)
+    release.set()
+    await in_flight
+    await asyncio.sleep(0.05)
+    assert hass.states.get(TRACKER).state == "home"
+    from homeassistant.util import dt as dt_util
+
+    # the requested poll runs after the debouncer's cooldown
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert hass.states.get(TRACKER).state == "not_home"
+
+
+async def test_entity_removed_before_the_start_logs_no_error(hass, router, make_entry, caplog):
+    import logging
+
+    entry = make_entry()
+    _enabled(hass, entry)
+    hass.set_state(CoreState.starting)
+    await _setup_loaded(hass, entry)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    caplog.clear()
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    assert not [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and not r.name.startswith("asyncio")
+    ]
+
+
+async def test_a_known_client_is_not_added_again(
+    hass, router, make_entry, freezer, caplog, monkeypatch
+):
+    import logging
+
+    from custom_components.openwrt import device_tracker
+
+    built = []
+    init = device_tracker.OpenWrtClientTracker.__init__
+
+    def _counting_init(self, *args, **kwargs):
+        built.append(args)
+        init(self, *args, **kwargs)
+
+    monkeypatch.setattr(device_tracker.OpenWrtClientTracker, "__init__", _counting_init)
+    entry = make_entry()  # the client is new: no registered tracker
+    entry.add_to_hass(hass)
+    await _setup_loaded(hass, entry)
+    caplog.clear()
+    await _poll(hass, freezer)
+    await _poll(hass, freezer)
+    assert len(built) == 1
+    assert not [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and not r.name.startswith("asyncio")
+    ]
     trackers = [e for e in er.async_get(hass).entities.values() if e.domain == "device_tracker"]
     assert len(trackers) == 1

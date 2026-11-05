@@ -360,3 +360,22 @@ async def test_shape_errors_of_optional_sources_keep_the_poll(hass, router, make
     await _poll(hass, freezer)
     assert hass.states.get(ONLINE).state == "on"
     assert hass.states.get(MEMORY).state == STATE_UNAVAILABLE
+
+
+async def test_empty_modem_file_is_quiet(hass, router, make_entry, caplog):
+    import logging
+
+    router.answers[("file", "read")] = {"data": ""}
+    caplog.set_level(logging.WARNING)
+    await _setup(hass, make_entry())
+    assert not [r for r in caplog.records if "modem" in r.getMessage()]
+
+
+async def test_empty_system_info_leaves_the_system_sensors_unavailable(
+    hass, router, make_entry, freezer
+):
+    await _setup(hass, make_entry())
+    assert hass.states.get(MEMORY).state != STATE_UNAVAILABLE
+    router.answers[("system", "info")] = {}
+    await _poll(hass, freezer)
+    assert hass.states.get(MEMORY).state == STATE_UNAVAILABLE

@@ -81,7 +81,9 @@ class OpenWrtClientTracker(ClientEntity, ScannerEntity):
         """False while a confirming poll of another router is outstanding.
 
         A router confirms with a poll started after the client left; one whose last
-        poll failed, or that was reloaded (a new coordinator), is not waited for.
+        poll failed, or that was reloaded (a new coordinator), is not waited for. A
+        router with no poll started since then is asked again (the debouncer drops a
+        request made while a poll runs).
         """
         if seen is not None:
             self._confirming = None
@@ -90,15 +92,21 @@ class OpenWrtClientTracker(ClientEntity, ScannerEntity):
         if self._confirming is None:
             if self._seen is None:
                 return True
-            others = [c for rid, c in current.items() if rid != self._seen.router]
-            self._confirming = {c.device_id: (c, c.polls_started) for c in others}
-            for c in others:
-                self.hass.async_create_task(c.async_request_refresh())
-        pending = [
-            rid
-            for rid, (c, started) in self._confirming.items()
-            if current.get(rid) is c and c.last_update_success and c.data_poll <= started
-        ]
+            self._confirming = {
+                rid: (c, c.polls_started)
+                for rid, c in current.items()
+                if rid != self._seen.router
+            }
+        pending = False
+        for rid, (c, started) in self._confirming.items():
+            if current.get(rid) is not c or not c.last_update_success or c.data_poll > started:
+                continue
+            pending = True
+            if c.polls_started <= started:
+                # not eager: every tracker of this dispatch takes its snapshot first
+                c.config_entry.async_create_background_task(
+                    self.hass, c.async_request_refresh(), "openwrt confirm", eager_start=False
+                )
         if pending:
             return False
         self._confirming = None
