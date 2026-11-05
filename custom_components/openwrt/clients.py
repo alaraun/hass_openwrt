@@ -11,13 +11,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import CoreState, Event, HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.start import async_at_started
 
 from .constants import DOMAIN
 
@@ -139,7 +139,7 @@ class ClientEntity(Entity):
         raise NotImplementedError
 
     @callback
-    def _async_handle_update(self, _event: Event | None = None) -> None:
+    def _async_handle_update(self) -> None:
         if self._async_refresh():
             self.async_write_ha_state()
 
@@ -150,14 +150,10 @@ class ClientEntity(Entity):
             async_dispatcher_connect(self.hass, SIGNAL_CLIENTS_UPDATED, self._async_handle_update)
         )
         if self.hass.state is not CoreState.running:
-            self.async_on_remove(
-                self.hass.bus.async_listen_once(
-                    EVENT_HOMEASSISTANT_STARTED, self._async_write_on_start
-                )
-            )
+            self.async_on_remove(async_at_started(self.hass, self._async_write_on_start))
 
     @callback
-    def _async_write_on_start(self, _event: Event) -> None:
+    def _async_write_on_start(self, _hass: HomeAssistant) -> None:
         self._async_refresh()
         self.async_write_ha_state()
 
@@ -183,11 +179,12 @@ def async_setup_client_entities(
         for iface in (device.data or {}).get("wireless", {}).values():
             for raw_mac in iface.get("macs", {}):
                 mac = format_mac(raw_mac)
-                if mac in known:
+                # a client another entry owns is tried again on every poll: that
+                # entry may be deleted
+                if mac in known or not claim(hass, entry, domain, mac, unique_id(mac)):
                     continue
                 known.add(mac)
-                if claim(hass, entry, domain, mac, unique_id(mac)):
-                    new.append(factory(hass, mac))
+                new.append(factory(hass, mac))
         if new:
             async_add_entities(new)
 

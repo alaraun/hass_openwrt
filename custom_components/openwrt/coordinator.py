@@ -7,7 +7,7 @@ import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util.json import json_loads
@@ -53,8 +53,10 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._wireless_via_uci = False
         self._cached_board_info: dict | None = None
         self._last_uptime: int = 0
-        # completed polls, failed ones too (client trackers wait for one)
-        self.poll_count = 0
+        # number of polls started, and the start number of the poll that produced
+        # self.data (client trackers wait for a poll started after an event)
+        self.polls_started = 0
+        self.data_poll = 0
 
     @property
     def device_id(self) -> str:
@@ -435,20 +437,19 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 response = await self._ubus.api_call(
                     "network.device", "status", dict(name=device_id)
                 )
+                _LOGGER.debug("WAN info: %s", response)
+                stats = response.get("statistics", {})
+                result[device_id] = {
+                    "up": response.get("up", False),
+                    "rx_bytes": stats.get("rx_bytes", 0),
+                    "tx_bytes": stats.get("tx_bytes", 0),
+                    "speed": response.get("speed"),
+                    "mac": response.get("macaddr"),
+                }
             except OPTIONAL_ERRORS as err:
                 _LOGGER.warning(
                     "Device [%s] failed to get status of %s: %s", self._id, device_id, err
                 )
-                continue
-            stats = response.get("statistics", {})
-            _LOGGER.debug("WAN info: %s", response)
-            result[device_id] = {
-                "up": response.get("up", False),
-                "rx_bytes": stats.get("rx_bytes", 0),
-                "tx_bytes": stats.get("tx_bytes", 0),
-                "speed": response.get("speed"),
-                "mac": response.get("macaddr"),
-            }
         return result
 
     async def fetch_host_hints(self) -> dict:
@@ -485,12 +486,11 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Modem stats file not available on device [%s]: %s", self._id, err
             )
             return {}
-        data_str = response.get("data", "")
-        if not data_str:
-            return {}
         try:
+            if not (data_str := response.get("data", "")):
+                return {}
             parsed = json_loads(data_str)
-        except ValueError as err:
+        except OPTIONAL_ERRORS as err:
             _LOGGER.warning(
                 "Device [%s] modem-stats.json is malformed (partial write?): %s",
                 self._id, err,
@@ -502,21 +502,21 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Get system information: uptime, memory, load. Empty if not readable."""
         try:
             response = await self._ubus.api_call("system", "info", {})
-        except UbusRPCError as err:
+            _LOGGER.debug("System info response: %s", response)
+            if not response:
+                return {}
+            return {
+                "uptime": response.get("uptime", 0),
+                "load": response.get("load", [0, 0, 0]),
+                "memory": response.get("memory", {}),
+                "localtime": response.get("localtime", 0),
+                "root": response.get("root", {}),
+                "tmp": response.get("tmp", {}),
+                "swap": response.get("swap", {}),
+            }
+        except OPTIONAL_ERRORS as err:
             _LOGGER.warning("Device [%s] failed to get system info: %s", self._id, err)
             return {}
-        _LOGGER.debug("System info response: %s", response)
-        if not response:
-            return {}
-        return {
-            "uptime": response.get("uptime", 0),
-            "load": response.get("load", [0, 0, 0]),
-            "memory": response.get("memory", {}),
-            "localtime": response.get("localtime", 0),
-            "root": response.get("root", {}),
-            "tmp": response.get("tmp", {}),
-            "swap": response.get("swap", {}),
-        }
 
     async def load_ubus(self) -> dict:
         """Log in if needed and return the session's ubus ACLs."""
@@ -559,12 +559,14 @@ class DeviceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.update_mesh(wireless_config["mesh"]),
         )
 
-    @callback
-    def async_update_listeners(self) -> None:
-        self.poll_count += 1
-        super().async_update_listeners()
-
     async def _async_update_data(self) -> dict[str, Any]:
+        self.polls_started += 1
+        started = self.polls_started
+        result = await self._async_poll()
+        self.data_poll = started
+        return result
+
+    async def _async_poll(self) -> dict[str, Any]:
         if self.data is not None and self.hass.state is not CoreState.running:
             # Polls wait for Home Assistant to finish starting: on a busy host its
             # start delays the replies past the timeout. The first refresh runs.

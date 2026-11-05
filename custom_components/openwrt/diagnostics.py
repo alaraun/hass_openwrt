@@ -9,7 +9,8 @@ from homeassistant.core import HomeAssistant
 
 from . import OpenWrtConfigEntry
 
-TO_REDACT = {"password", "username", "imei", "iccid"}
+# credentials, modem identities, and the LAN's clients (diagnostics are often posted)
+TO_REDACT = {"password", "username", "imei", "iccid", "hosts", "macs"}
 
 
 async def async_get_config_entry_diagnostics(

@@ -121,3 +121,19 @@ async def test_debug_log_holds_no_password_or_session(hass, router, caplog):
     assert "system.info" in caplog.text
     assert PASSWORD not in caplog.text
     assert SESSION not in caplog.text
+
+
+async def test_reply_of_the_wrong_shape_is_a_connection_error(hass, router):
+    ubus = _client(hass, router)
+    await ubus.login()
+    for body in (b"[1, 2]", b'{"jsonrpc": "2.0", "result": []}', b'{"jsonrpc": "2.0", "result": {}}'):
+        router.answers[("system", "info")] = body
+        with pytest.raises(UbusConnectionError, match="malformed reply"):
+            await ubus.api_call("system", "info", {})
+
+
+async def test_login_reply_without_a_session_is_a_connection_error(hass, router):
+    router.answers[("session", "login")] = {"acls": {}}
+    ubus = _client(hass, router)
+    with pytest.raises(UbusConnectionError, match="no session"):
+        await ubus.login()

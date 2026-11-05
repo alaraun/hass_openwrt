@@ -51,7 +51,8 @@ class OpenWrtClientTracker(ClientEntity, ScannerEntity):
         ClientEntity.__init__(self, hass, mac)
         self._attr_mac_address = mac
         self._attr_hostname = self._host_name
-        self._confirming: dict[Any, int] | None = None
+        # router id -> (its coordinator, polls it had started when the client left)
+        self._confirming: dict[str, tuple[Any, int]] | None = None
 
     @property
     def unique_id(self) -> str:
@@ -77,7 +78,11 @@ class OpenWrtClientTracker(ClientEntity, ScannerEntity):
 
     @callback
     def _gone_confirmed(self, seen) -> bool:
-        """False while the other routers' confirming polls are outstanding."""
+        """False while a confirming poll of another router is outstanding.
+
+        A router confirms with a poll started after the client left; one whose last
+        poll failed, or that was reloaded (a new coordinator), is not waited for.
+        """
         if seen is not None:
             self._confirming = None
             return True
@@ -86,13 +91,14 @@ class OpenWrtClientTracker(ClientEntity, ScannerEntity):
             if self._seen is None:
                 return True
             others = [c for rid, c in current.items() if rid != self._seen.router]
-            self._confirming = {c.device_id: c.poll_count for c in others}
+            self._confirming = {c.device_id: (c, c.polls_started) for c in others}
             for c in others:
                 self.hass.async_create_task(c.async_request_refresh())
-        pending = {
-            rid: n for rid, n in self._confirming.items()
-            if rid in current and current[rid].poll_count <= n
-        }
+        pending = [
+            rid
+            for rid, (c, started) in self._confirming.items()
+            if current.get(rid) is c and c.last_update_success and c.data_poll <= started
+        ]
         if pending:
             return False
         self._confirming = None

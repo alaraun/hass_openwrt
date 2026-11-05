@@ -286,3 +286,144 @@ async def test_claim_before_the_registry_has_the_entity(hass):
     assert claim(hass, first, "device_tracker", "02:00:00:00:00:03", uid)
     release_claims(hass, first)
     assert claim(hass, second, "device_tracker", "02:00:00:00:00:03", uid)
+
+
+async def _tick(hass, freezer, seconds: float = 31) -> None:
+    await _poll(hass, freezer, seconds)
+
+
+async def test_failing_router_does_not_block_not_home(hass, router_factory, make_entry, freezer):
+    """A router whose polls keep failing cannot confirm; it is not waited for."""
+    first, second = await _two_routers(hass, router_factory, make_entry)
+    entry_a, entry_b = hass.config_entries.async_entries("openwrt")
+    second.answers[("system", "info")] = b"not json"
+    await _poll_only(hass, entry_b)
+    await _poll_only(hass, entry_b)  # a second failure in a row updates no listener
+    first.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {}}
+    await _poll_only(hass, entry_a)
+    assert hass.states.get(TRACKER).state == "not_home"
+
+
+async def test_reloaded_router_confirms_with_its_new_coordinator(hass, router_factory, make_entry):
+    """B is reloaded while its confirming poll hangs: the old coordinator is not waited
+    for, the new one's poll confirms."""
+    import asyncio
+
+    first, second = await _two_routers(hass, router_factory, make_entry)
+    entry_a, entry_b = hass.config_entries.async_entries("openwrt")
+    for _ in range(5):
+        await _poll_only(hass, entry_b)
+    info = second.answers[("system", "info")]
+    release = asyncio.Event()
+    hung = []
+
+    async def _first_call_hangs(params):
+        if not hung:
+            hung.append(True)
+            await release.wait()
+        return info
+
+    second.answers[("system", "info")] = _AsyncAnswer(_first_call_hangs)
+    first.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {}}
+    await entry_a.runtime_data.async_refresh()
+    await asyncio.sleep(0.05)  # B's confirming poll now waits for its answer
+    assert hung
+    assert hass.states.get(TRACKER).state == "home"
+    assert await hass.config_entries.async_reload(entry_b.entry_id)
+    await asyncio.sleep(0.1)  # block_till_done would wait for the hung poll
+    await entry_a.runtime_data.async_refresh()
+    await asyncio.sleep(0.1)
+    assert hass.states.get(TRACKER).state == "not_home"
+    release.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+async def test_a_poll_started_before_the_departure_does_not_confirm(hass, router_factory, make_entry):
+    """B's poll that read B's client list before the client arrived, and finishes after
+    the client left A, does not confirm; the poll requested at the departure does."""
+    import asyncio
+
+    first, second = await _two_routers(hass, router_factory, make_entry)
+    entry_a, entry_b = hass.config_entries.async_entries("openwrt")
+    release = asyncio.Event()
+    hints = second.answers[("luci-rpc", "getHostHints")]
+
+    async def _held_hints(params):
+        await release.wait()
+        return hints
+
+    second.answers[("luci-rpc", "getHostHints")] = _AsyncAnswer(_held_hints)
+    in_flight = hass.async_create_task(entry_b.runtime_data.async_refresh())
+    for _ in range(50):
+        if second.calls_of("hostapd.phy0-ap0", "get_clients"):
+            break
+        await asyncio.sleep(0.01)
+    # B's list is read (no client); the client roams A -> B; A polls
+    second.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {CLIENT_MAC: {"signal": -60}}}
+    first.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {}}
+    states = _record(hass, TRACKER)
+    await entry_a.runtime_data.async_refresh()
+    await asyncio.sleep(0.1)
+    release.set()
+    await in_flight
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert "not_home" not in states
+    assert hass.states.get(TRACKER).attributes["router"] == "ap-b"
+
+
+class _AsyncAnswer:
+    """A fake-router answer computed by a coroutine."""
+
+    def __init__(self, func) -> None:
+        self.func = func
+
+
+async def test_entity_removed_after_start_logs_no_error(hass, router, make_entry, caplog):
+    import logging
+
+    entry = make_entry()
+    _enabled(hass, entry)
+    hass.set_state(CoreState.starting)
+    await _setup_loaded(hass, entry)
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    assert hass.states.get(TRACKER).state == "home"
+    caplog.clear()
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_other_router_takes_over_a_deleted_owner(hass, router_factory, make_entry):
+    first, second = await _two_routers(hass, router_factory, make_entry)
+    entry_a, entry_b = hass.config_entries.async_entries("openwrt")
+    second.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {CLIENT_MAC: {"signal": -60}}}
+    await _poll_only(hass, entry_b)
+    assert await hass.config_entries.async_remove(entry_a.entry_id)
+    await hass.async_block_till_done()
+    await _poll_only(hass, entry_b)
+    trackers = [e for e in er.async_get(hass).entities.values() if e.domain == "device_tracker"]
+    assert [t.config_entry_id for t in trackers] == [entry_b.entry_id]
+
+
+async def test_signal_sensor_without_a_signal_is_unavailable(hass, router, make_entry, freezer):
+    reg = er.async_get(hass)
+    entry = make_entry()
+    entry.add_to_hass(hass)
+    reg.async_get_or_create(
+        "sensor", "openwrt", SIGNAL_UID, config_entry=entry, suggested_object_id="laptop_wi_fi_signal"
+    )
+    router.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {CLIENT_MAC: {}}}
+    await _setup_loaded(hass, entry)
+    assert hass.states.get(SIGNAL).state == STATE_UNAVAILABLE
+
+
+async def test_upper_case_hostapd_mac_is_one_client(hass, router, make_entry):
+    router.answers[("hostapd.phy0-ap0", "get_clients")] = {"clients": {CLIENT_MAC.upper(): {"signal": -50}}}
+    entry = make_entry()
+    _enabled(hass, entry)
+    await _setup_loaded(hass, entry)
+    assert hass.states.get(TRACKER).state == "home"
+    trackers = [e for e in er.async_get(hass).entities.values() if e.domain == "device_tracker"]
+    assert len(trackers) == 1

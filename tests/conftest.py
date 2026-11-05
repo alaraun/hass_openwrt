@@ -20,7 +20,7 @@ USERNAME = "hass"
 PASSWORD = "test-password"
 SESSION = "c0ffee00c0ffee00c0ffee00c0ffee00"
 
-CLIENT_MAC = "02:00:00:00:00:01"
+CLIENT_MAC = "02:00:00:00:00:0a"  # hex letters: hint keys are upper case
 HOST_IP = "192.0.2.10"
 
 UCI_WIRELESS = {
@@ -138,7 +138,9 @@ class FakeRouter:
             answer = RpcError(-32002, "Access denied")
         else:
             answer = self.answers.get((obj, method), RpcError(-32000, "Object not found"))
-        if callable(answer) and not isinstance(answer, type):
+        if hasattr(answer, "func"):
+            answer = await answer.func(params)
+        elif callable(answer) and not isinstance(answer, type):
             answer = answer(params)
         if isinstance(answer, Stall):
             fut = asyncio.get_running_loop().create_future()

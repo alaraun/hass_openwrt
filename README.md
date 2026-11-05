@@ -44,7 +44,7 @@ otherwise. Its attributes are the IP address and host name (from the routers' ho
 the MAC address, and the `router` and `ssid` it is on. Moving between routers changes only
 these two attributes. Routers are polled at different times; when a client leaves the router
 it was on, the other routers are polled at once, and the tracker shows `not_home` only if none
-of them has it.
+of them has it in a poll started after that (a router whose last poll failed is not waited for).
 
 Trackers are created disabled: enable the ones you want under **Settings → Entities**
 (filter on the integration, show disabled entities). They have no device of their own, so the
@@ -54,8 +54,8 @@ first.
 Each client also gets a `<name> Wi-Fi signal` sensor (dBm, at the access point it is on). It is
 disabled by default: an enabled one records a value on most polls.
 
-While Home Assistant starts, the trackers stay unavailable until every router has been read.
-A router whose poll fails keeps its last client list.
+The trackers stay unavailable until Home Assistant has started. A router whose poll fails keeps
+its last client list. Requires Home Assistant 2026.11 or newer.
 
 ### Recorder
 

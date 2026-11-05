@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 
 - The wireless clients sensors no longer list each client as an attribute (the trackers and signal sensors do); they now change only with the client count.
 - Call time limits: 10 s to connect, 30 s for the answer (was 15 s for both).
+- Requires Home Assistant 2026.11 (`hacs.json`).
+- Diagnostics redact the client lists (`hosts`, `macs`).
 - **System uptime** is a timestamp sensor holding the boot time; its state changes only on a reboot (it was a text such as `14d 23h 32m` with a `seconds` attribute, rewritten on every poll).
 - Attributes that change on most polls (per-client details, mesh peers, known hosts, per-SSID totals, memory, load and disk details) are no longer recorded; they stay visible live.
 - The modem mode sensor drops the `last_update` attribute (use the `Modem last update` sensor).
@@ -26,7 +28,7 @@ All notable changes to this project will be documented in this file.
 - Polls wait until Home Assistant has finished starting (the first refresh still runs): on a busy host, the calls made while other integrations start could wait out the 15 s timeout on every router at once.
 - Debug logging wrote the login password and the session id.
 - A rejected password starts Home Assistant's re-authentication; reauth used to open the setup form again. A login refused while the router boots is retried instead.
-- A call the ACL does not allow, or an optional call (mwan3, WAN status, board info) that fails, no longer fails the whole poll.
+- A call the ACL does not allow, or an optional call (mwan3, WAN status, board info, modem file, system info) that fails or answers in an unexpected shape, no longer fails the whole poll.
 - The dynamic sensor listener is removed when the entry unloads.
 
 ### Internal

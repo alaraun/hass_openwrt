@@ -274,10 +274,89 @@ async def test_wireless_status_failure_falls_back_to_uci_once(hass, router, make
 async def test_diagnostics_redact_credentials(hass, router, make_entry):
     from custom_components.openwrt.diagnostics import async_get_config_entry_diagnostics
 
+    router.answers[("file", "read")] = {
+        "data": '{"mode": "LTE", "imei": "000000000000000", "iccid": "0000000000000000000"}'
+    }
     entry = make_entry()
     await _setup(hass, entry)
     diag = await async_get_config_entry_diagnostics(hass, entry)
     assert diag["entry"]["password"] == "**REDACTED**"
     assert diag["entry"]["username"] == "**REDACTED**"
+    assert diag["data"]["modem"]["imei"] == "**REDACTED**"
+    assert diag["data"]["modem"]["iccid"] == "**REDACTED**"
     assert diag["wireless_via_uci"] is True
     assert diag["data"]["wireless"]["phy0-ap0"]["clients"] == 1
+    assert diag["data"]["wireless"]["phy0-ap0"]["macs"] == "**REDACTED**"
+    assert diag["data"]["hosts"] == "**REDACTED**"
+
+
+async def test_boot_time_does_not_move_while_polls_wait_for_the_start(
+    hass, router, make_entry, freezer
+):
+    """Skipped polls repeat the previous data; its uptime is stale."""
+    from homeassistant.core import CoreState
+    from homeassistant.util import dt as dt_util
+
+    from .conftest import default_answers
+
+    boot = dt_util.utcnow() - timedelta(seconds=1000)
+    info = default_answers()[("system", "info")]
+    router.answers[("system", "info")] = lambda _p: {
+        **info, "uptime": int((dt_util.utcnow() - boot).total_seconds())
+    }
+    hass.set_state(CoreState.starting)
+    await _setup(hass, make_entry())
+    changes: list[str] = []
+    hass.bus.async_listen(
+        "state_changed",
+        lambda ev: changes.append(ev.data["new_state"].state)
+        if ev.data["entity_id"] == UPTIME else None,
+    )
+    for _ in range(4):
+        await _poll(hass, freezer)
+    hass.set_state(CoreState.running)
+    await _poll(hass, freezer)
+    assert changes == []
+
+
+async def test_unknown_uptime_leaves_the_boot_time(hass, router, make_entry, freezer):
+    await _setup(hass, make_entry())
+    boot = hass.states.get(UPTIME).state
+    router.answers[("system", "info")] = {**router.answers[("system", "info")], "uptime": 0}
+    await _poll(hass, freezer)
+    assert hass.states.get(UPTIME).state == boot
+
+
+async def test_mesh_peer_connection_error_fails_the_poll(hass, router, make_entry, freezer):
+    router.acls["ubus"]["iwinfo"] = ["info", "assoclist"]
+    values = dict(UCI_WIRELESS["values"])
+    values["mesh0"] = {
+        ".type": "wifi-iface", ".name": "mesh0", ".index": 3,
+        "device": "radio0", "mode": "mesh", "mesh_id": "testmesh",
+    }
+    router.answers[("uci", "get")] = {"values": values}
+    router.answers[("iwinfo", "info")] = {"bssid": "02:00:00:00:00:b0", "signal": -40}
+    router.answers[("iwinfo", "assoclist")] = {"mesh plink": "ESTAB", "signal": -45}
+    await _setup(hass, make_entry())
+    await _poll(hass, freezer)  # the router's own mesh MAC is now a known peer
+    assert hass.states.get("sensor.openwrt_test_ap_mesh_phy0_mesh0_peers").state == "1"
+    router.answers[("iwinfo", "assoclist")] = b"not json"
+    await _poll(hass, freezer)
+    assert hass.states.get(ONLINE).state == STATE_UNAVAILABLE
+
+
+async def test_shape_errors_of_optional_sources_keep_the_poll(hass, router, make_entry, freezer):
+    """mwan3, WAN status and board answers of an unexpected shape are skipped."""
+    router.acls["ubus"]["mwan3"] = ["status"]
+    router.answers[("mwan3", "status")] = {"interfaces": ["not", "a", "dict"]}
+    router.answers[("network.device", "status")] = ["not a dict"]
+    router.answers[("system", "board")] = {"model": "Test Router", "release": "25.12"}
+    router.answers[("file", "read")] = ["not a dict"]
+    entry = make_entry(wan_devices="wan")
+    await _setup(hass, entry)
+    assert entry.state.name == "LOADED"
+    assert hass.states.get(ONLINE).state == "on"
+    router.answers[("system", "info")] = ["not a dict"]
+    await _poll(hass, freezer)
+    assert hass.states.get(ONLINE).state == "on"
+    assert hass.states.get(MEMORY).state == STATE_UNAVAILABLE

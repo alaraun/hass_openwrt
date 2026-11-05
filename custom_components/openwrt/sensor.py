@@ -416,10 +416,16 @@ class SystemUptimeSensor(_SystemInfoSensor):
         self._attr_unique_id = f"{self._attr_unique_id}.system_uptime"
         self._boot_time: datetime | None = None
         self._last_uptime = 0
+        self._last_info: dict | None = None
         self._update_boot_time()
 
     def _update_boot_time(self) -> None:
-        uptime = self._system_info.get("uptime", 0)
+        # a poll skipped while Home Assistant starts, or a failed one, keeps the
+        # previous data: its uptime is stale
+        if (info := self._system_info) is self._last_info:
+            return
+        self._last_info = info
+        uptime = info.get("uptime", 0)
         if not uptime:
             return
         boot_time = dt_util.utcnow().replace(microsecond=0) - timedelta(seconds=uptime)
